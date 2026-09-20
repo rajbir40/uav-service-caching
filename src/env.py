@@ -1,9 +1,16 @@
 """
-Phase-1 UAV-MEC environment
-===========================
-Minimal foundation for later service-chain / A2A / caching work.
+Phase-2 UAV-MEC environment
+============================
+Extends Phase-1 with:
+  - Explicit task lifecycle: ARRIVED → ASSIGNED → UPLOADING → QUEUED → COMPUTING → COMPLETED
+  - Persistent FIFO queues; unfinished tasks span multiple slots
+  - Wall-clock timing with strict identity: T_total = T_upload + T_queue + T_compute
+  - Deadline tracking per task (deadline_missed flag)
+  - Battery-depletion enforcement: depleted UAVs stop moving and reject new tasks
+  - Episode-level percentile latency (p50 / p95 / p99)
+  - Expanded info dict with tasks_pending, deadline_misses, energy aliases
 
-  Fixed IoT users --A2G--> UAV queue --> CPU --> completed task
+Fixed IoT users --A2G--> UAV upload queue --> CPU queue --> completed task
 
 Intentionally NOT in this phase:
   user mobility, NOMA/SIC, jammers, wind, A2A, service chains,
@@ -130,19 +137,29 @@ class Task:
         self.assigned_uav_id = None
         self.remaining_bits = float(data_size_bits)
         self.remaining_cycles = float(cpu_cycles)
+        # Upload timing
         self.upload_start_time = None
+        self.upload_finish_time = None    # Phase-2: wall-clock upload completion time
         self.enqueue_time = None
+        # Compute timing
         self.compute_start_time = None
+        self.compute_finish_time = None   # Phase-2: wall-clock compute completion time
+        # Latency components (seconds)
         self.t_upload = 0.0
         self.t_queue = 0.0
         self.t_compute = 0.0
         self.t_a2a = 0.0
         self.t_total = 0.0
+        # Channel snapshot at last active upload slot
         self.last_a2g_distance = 0.0
         self.last_a2g_rate = 0.0
         self.allocated_cpu_hz = 0.0
+        # Elapsed counters (for multi-slot spanning)
         self.upload_elapsed = 0.0
         self.compute_elapsed = 0.0
+        # Phase-2: deadline tracking
+        self.deadline_missed = False      # True if t_total > deadline
+        # Lifecycle status
         self.status = "generated"
 
     @classmethod
@@ -153,7 +170,7 @@ class Task:
 class DomainRandomiser:
     """
     Kept so existing training scripts can still import it.
-    Phase 1 does not apply jammer/wind randomisation.
+    Phase 1/2 does not apply jammer/wind randomisation.
     """
 
     def __init__(self, rng=None):
@@ -175,7 +192,7 @@ class DomainRandomiser:
 # ================================================================
 class MultiUAVMECEnv:
     """
-    Phase-1 CTDE environment.
+    Phase-2 CTDE environment.
 
     Action per agent (length 5, values in [-1, 1]):
       a[0] dx  — x velocity command (× max_displacement metres / slot)
@@ -184,6 +201,13 @@ class MultiUAVMECEnv:
       a[3], a[4] unused padding (MAPPO width compatibility)
 
     Scheduling is heuristic: nearest-UAV association + FIFO compute.
+
+    Phase-2 additions (vs Phase-1):
+      - Persistent queues: tasks span multiple slots for upload and compute.
+      - Explicit timing: t_queue = upload_buffer_wait + cpu_queue_wait.
+      - Deadline tracking per completed task.
+      - Battery-depletion: UAV stops moving and rejects new tasks.
+      - Episode-level p50/p95/p99 latency in info dict.
     """
 
     def __init__(self, num_users=NUM_USERS, num_uavs=NUM_UAVS,
@@ -226,9 +250,17 @@ class MultiUAVMECEnv:
         self.state_dim = self.global_state_dim
         self.action_dim = self.agent_action_dim * self.n_agents
 
+        # Slot-level tracking
         self.completed_tasks = []
         self._slot_generated = 0
         self._slot_completed = []
+        self._slot_deadline_misses = 0
+
+        # Phase-2: episode-level accumulators for percentile latency and stats
+        self._episode_latencies: list = []
+        self._episode_tasks_generated = 0
+        self._episode_tasks_completed = 0
+        self._episode_deadline_misses = 0
 
     # ----------------------------------------------------------
     # Construction
@@ -313,9 +345,17 @@ class MultiUAVMECEnv:
         return calculate_total_latency(t_upload, t_queue, t_compute, t_a2a)
 
     def associate_task(self, task):
-        """Modular assignment hook. Phase 1: nearest UAV."""
+        """
+        Modular assignment hook. Phase 1/2: nearest UAV.
+        Phase-2: battery-depleted UAVs cannot accept new tasks.
+        Returns the assigned uav_id, or None if all UAVs are depleted.
+        """
         user = self.devices[task.user_id]
-        uav_id, dist = associate_nearest(user.position, self._active_uavs())
+        # Filter to active UAVs with remaining battery
+        available = [u for u in self._active_uavs() if u.battery_energy > 0.0]
+        if not available:
+            return None  # all active UAVs depleted; caller should drop the task
+        uav_id, dist = associate_nearest(user.position, available)
         task.assigned_uav_id = uav_id
         task.last_a2g_distance = dist
         return uav_id
@@ -457,9 +497,16 @@ class MultiUAVMECEnv:
         self.wind_speed = 0.0
         self.channel.wind_speed = 0.0
         self._init_entities()
+        # Slot-level trackers
         self.completed_tasks = []
         self._slot_generated = 0
         self._slot_completed = []
+        self._slot_deadline_misses = 0
+        # Phase-2: reset episode accumulators
+        self._episode_latencies = []
+        self._episode_tasks_generated = 0
+        self._episode_tasks_completed = 0
+        self._episode_deadline_misses = 0
         return self.get_all_local_obs(), self.get_global_state()
 
     def step(self, actions):
@@ -468,8 +515,10 @@ class MultiUAVMECEnv:
             actions = actions.reshape(self.n_agents, self.agent_action_dim)
         self.t += 1
         now = self._sim_time()
+        # Reset slot-level trackers
         self._slot_generated = 0
         self._slot_completed = []
+        self._slot_deadline_misses = 0
 
         e_flight = np.zeros(MAX_UAVS)
         e_comm = np.zeros(MAX_UAVS)
@@ -486,6 +535,13 @@ class MultiUAVMECEnv:
             uav.total_energy += spent
             uav.battery_energy = max(0.0, uav.battery_energy - spent)
 
+        # Phase-2: update episode accumulators after processing
+        self._episode_tasks_generated += self._slot_generated
+        self._episode_tasks_completed += len(self._slot_completed)
+        self._episode_deadline_misses += self._slot_deadline_misses
+        for t in self._slot_completed:
+            self._episode_latencies.append(t.t_total)
+
         rewards, info = self._pack_reward_info(e_flight, e_comm, e_comp, e_total_vec)
         done = self.t >= NUM_TIME_SLOTS
         return self.get_all_local_obs(), self.get_global_state(), rewards, done, info
@@ -496,6 +552,14 @@ class MultiUAVMECEnv:
     def _move_uavs(self, actions, e_flight):
         r_limit = self.area_radius * 0.88
         for agent_id, uav in enumerate(self._active_uavs()):
+            # Phase-2: battery-depleted UAVs cannot move
+            if uav.battery_energy <= 0.0:
+                uav.vx = 0.0
+                uav.vy = 0.0
+                uav.vz = 0.0
+                e_flight[agent_id] = 0.0
+                continue
+
             a = actions[agent_id]
             max_speed = uav.max_displacement
             uav.vx = float(np.clip(a[0], -1.0, 1.0)) * max_speed
@@ -533,8 +597,12 @@ class MultiUAVMECEnv:
                 cpu_cycles=float(cycles[i]),
                 deadline=float(deadlines[i]),
             )
-            self.associate_task(task)
+            # Phase-2: associate_task returns None if all UAVs are depleted
+            assigned = self.associate_task(task)
+            if assigned is None:
+                continue  # drop task; no available UAV
             uav = self.uavs[task.assigned_uav_id]
+            task.status = "assigned"
             uav.upload_buffer.append(task)
             dev.pending_tasks.append(task)
             self._slot_generated += 1
@@ -561,6 +629,9 @@ class MultiUAVMECEnv:
             e_comm[uav.id] += PHASE1_UAV_RX_POWER_W * SLOT_DURATION
 
             if task.remaining_bits <= 1e-9:
+                # Phase-2: record wall-clock upload finish time
+                task.upload_finish_time = now
+                # t_upload: theoretical if < 1 slot, else actual elapsed wall-clock
                 inst = calculate_upload_latency(task.data_size_bits, max(rate, 1e-12))
                 task.t_upload = inst if inst <= SLOT_DURATION else task.upload_elapsed
                 task.enqueue_time = now
@@ -576,9 +647,21 @@ class MultiUAVMECEnv:
                 task = uav.task_queue.popleft()
                 task.compute_start_time = now
                 task.allocated_cpu_hz = uav.cpu_freq
-                waited = calculate_queue_latency(
-                    task.arrival_time, task.compute_start_time)
-                task.t_queue = max(0.0, waited - task.t_upload)
+                # Phase-2: t_queue = upload-buffer wait + CPU-queue wait
+                #   upload_buffer_wait = upload_start_time - arrival_time
+                #   cpu_queue_wait     = compute_start_time - upload_finish_time
+                # This ensures t_total = t_upload + t_queue + t_compute exactly.
+                upload_buffer_wait = max(
+                    0.0,
+                    (task.upload_start_time - task.arrival_time)
+                    if task.upload_start_time is not None else 0.0,
+                )
+                cpu_queue_wait = max(
+                    0.0,
+                    (task.compute_start_time - task.upload_finish_time)
+                    if task.upload_finish_time is not None else 0.0,
+                )
+                task.t_queue = upload_buffer_wait + cpu_queue_wait
                 task.status = "computing"
                 uav.computing = task
 
@@ -592,11 +675,18 @@ class MultiUAVMECEnv:
             e_comp[uav.id] += computation_energy(uav.cpu_freq, processed)
 
             if task.remaining_cycles <= 1e-6:
+                # Phase-2: wall-clock compute finish time
+                task.compute_finish_time = now
                 closed = calculate_compute_latency(task.cpu_cycles, uav.cpu_freq)
                 task.t_compute = closed if closed <= SLOT_DURATION else task.compute_elapsed
                 task.t_a2a = calculate_a2a_latency()
+                # t_total = sum of components — identity holds by construction
                 task.t_total = calculate_total_latency(
                     task.t_upload, task.t_queue, task.t_compute, task.t_a2a)
+                # Phase-2: deadline check
+                task.deadline_missed = (task.t_total > task.deadline)
+                if task.deadline_missed:
+                    self._slot_deadline_misses += 1
                 task.status = "completed"
                 self.completed_tasks.append(task)
                 self._slot_completed.append(task)
@@ -606,58 +696,107 @@ class MultiUAVMECEnv:
         completed = self._slot_completed
         if completed:
             mean_upload = float(np.mean([t.t_upload for t in completed]))
-            mean_queue = float(np.mean([t.t_queue for t in completed]))
-            mean_comp = float(np.mean([t.t_compute for t in completed]))
-            mean_total = float(np.mean([t.t_total for t in completed]))
-            mean_rate = float(np.mean([t.last_a2g_rate for t in completed]))
-            mean_dist = float(np.mean([t.last_a2g_distance for t in completed]))
+            mean_queue  = float(np.mean([t.t_queue  for t in completed]))
+            mean_comp   = float(np.mean([t.t_compute for t in completed]))
+            mean_total  = float(np.mean([t.t_total  for t in completed]))
+            mean_rate   = float(np.mean([t.last_a2g_rate     for t in completed]))
+            mean_dist   = float(np.mean([t.last_a2g_distance for t in completed]))
         else:
             mean_upload = mean_queue = mean_comp = mean_total = 0.0
             mean_rate = mean_dist = 0.0
 
         fleet_energy = float(np.sum(e_total_vec[:self.num_active]))
         # Reward: -(α L̃ + β Ẽ)
-        # L̃ = mean completed-task latency / PHASE1_LAT_NORM  (seconds → O(1))
-        # Ẽ = fleet energy this slot / PHASE1_ENERGY_NORM     (joules → O(1))
         lat_term = mean_total / PHASE1_LAT_NORM
-        en_term = fleet_energy / PHASE1_ENERGY_NORM
+        en_term  = fleet_energy / PHASE1_ENERGY_NORM
         global_reward = -(ALPHA_LATENCY * lat_term + BETA_ENERGY * en_term)
         rewards = np.full(MAX_UAVS, global_reward, dtype=np.float64)
         rewards[self.num_active:] = 0.0
 
-        batteries = [float(u.battery_energy) for u in self._active_uavs()]
+        # Phase-2: percentile latency from episode history
+        ep_lats = self._episode_latencies
+        if ep_lats:
+            arr = np.array(ep_lats, dtype=float)
+            p50 = float(np.percentile(arr, 50))
+            p95 = float(np.percentile(arr, 95))
+            p99 = float(np.percentile(arr, 99))
+        else:
+            p50 = p95 = p99 = 0.0
+
+        # Phase-2: pending tasks across all active UAVs
+        tasks_pending = int(sum(
+            len(u.upload_buffer) + int(u.active_upload is not None) +
+            len(u.task_queue) + int(u.computing is not None)
+            for u in self._active_uavs()
+        ))
+
+        batteries  = [float(u.battery_energy) for u in self._active_uavs()]
         queue_lens = []
         for u in self._active_uavs():
             backlog = (len(u.upload_buffer) + len(u.task_queue)
                        + int(u.active_upload is not None)
                        + int(u.computing is not None))
             queue_lens.append(backlog)
+
+        avg_queue_len = float(np.mean(queue_lens)) if queue_lens else 0.0
+        max_queue_len = int(max(queue_lens)) if queue_lens else 0
+
+        e_fl  = float(np.sum(e_flight[:self.num_active]))
+        e_co  = float(np.sum(e_comm[:self.num_active]))
+        e_cp  = float(np.sum(e_comp[:self.num_active]))
+
         info = {
+            # ---- slot-level task counters (Phase-1 + Phase-2 keys) ----
             "num_tasks_generated": self._slot_generated,
             "num_tasks_completed": len(completed),
-            "upload_latency": mean_upload,
-            "queue_latency": mean_queue,
+            "tasks_generated":     self._slot_generated,
+            "tasks_completed":     len(completed),
+            "tasks_pending":       tasks_pending,
+            "deadline_misses":     self._slot_deadline_misses,
+            # ---- episode-level counters (Phase-2) ----
+            "episode_tasks_generated":  self._episode_tasks_generated,
+            "episode_tasks_completed":  self._episode_tasks_completed,
+            "episode_deadline_misses":  self._episode_deadline_misses,
+            # ---- latency breakdown (slot average) ----
+            "upload_latency":  mean_upload,
+            "queue_latency":   mean_queue,
             "compute_latency": mean_comp,
-            "a2a_latency": 0.0,
-            "total_latency": mean_total,
-            "avg_latency": mean_total,
-            "energy_consumed": fleet_energy,
-            "energy_flight": float(np.sum(e_flight[:self.num_active])),
-            "energy_communication": float(np.sum(e_comm[:self.num_active])),
-            "energy_computation": float(np.sum(e_comp[:self.num_active])),
-            "total_energy_uav": fleet_energy,
+            "a2a_latency":     0.0,
+            "total_latency":   mean_total,
+            "avg_latency":     mean_total,
+            # ---- percentile latency (episode, Phase-2) ----
+            "p50_latency": p50,
+            "p95_latency": p95,
+            "p99_latency": p99,
+            # ---- queue stats ----
+            "queue_length":     queue_lens,
+            "avg_queue_length": avg_queue_len,
+            "max_queue_length": max_queue_len,
+            # ---- energy (both naming conventions kept for compatibility) ----
+            "energy_consumed":       fleet_energy,
+            "energy_flight":         e_fl,
+            "energy_communication":  e_co,
+            "energy_computation":    e_cp,
+            "flight_energy":         e_fl,
+            "communication_energy":  e_co,
+            "computation_energy":    e_cp,
+            "total_energy":          fleet_energy,
+            "total_energy_uav":      fleet_energy,
+            # ---- battery ----
             "battery": batteries,
-            "queue_length": queue_lens,
-            "a2g_rate": mean_rate,
+            # ---- A2G channel ----
+            "a2g_rate":     mean_rate,
             "a2g_distance": mean_dist,
-            "time_slot": self.t,
+            # ---- simulation state ----
+            "time_slot":       self.t,
             "num_active_uavs": self.num_active,
+            # ---- compatibility stubs (DMJO legacy) ----
             "noma_pairs_formed": 0,
-            "jammer_blocked": 0,
-            "wind_speed": 0.0,
-            "wind_direction": 0.0,
-            "cache_local_hits": 0,
-            "cache_coop_hits": 0,
-            "cache_bs_fetches": 0,
+            "jammer_blocked":    0,
+            "wind_speed":        0.0,
+            "wind_direction":    0.0,
+            "cache_local_hits":  0,
+            "cache_coop_hits":   0,
+            "cache_bs_fetches":  0,
         }
         return rewards, info
