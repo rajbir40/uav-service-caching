@@ -136,6 +136,21 @@ class ChannelModel:
         return self.transmission_rate(
             tx_power, gain, bandwidth, noise_psd, interference_power=0.0)
 
+    def a2a_rate(self, pos_uav1, pos_uav2, tx_power=0.01, bandwidth=None,
+                 noise_psd=NOISE_PSD):
+        """
+        Explicit UAV-to-UAV (A2A) communication rate (Phase 4).
+
+        R_A2A = B_A2A * log2(1 + P_tx * g_A2A / (N0 * B_A2A))
+        where g_A2A = eta_LoS * d^(-l) based on 3D Euclidean distance.
+        """
+        if bandwidth is None:
+            from config import A2A_BANDWIDTH
+            bandwidth = A2A_BANDWIDTH
+        gain = self.a2a_channel_gain(pos_uav1, pos_uav2)
+        return self.transmission_rate(
+            tx_power, gain, bandwidth, noise_psd, interference_power=0.0)
+
     def sinr_under_jamming(self, tx_power, channel_gain_signal,
                            jammer_power, channel_gain_jammer,
                            noise_psd=NOISE_PSD, bandwidth=RBS_BANDWIDTH):

@@ -272,8 +272,8 @@ def test_total_latency_identity_phase3():
         np.testing.assert_allclose(t.t_queue, sum_stage_queue, rtol=1e-9, atol=1e-9)
         np.testing.assert_allclose(t.t_compute, sum_stage_compute, rtol=1e-9, atol=1e-9)
 
-        # 3. T_A2A must remain exactly 0.0 in Phase 3
-        assert t.t_a2a == 0.0, f"Expected t_a2a == 0.0, got {t.t_a2a}"
+        # 3. T_A2A was zero in Phase 3, now positive in Phase 4 for cross-UAV transitions
+        assert t.t_a2a >= 0.0, f"Expected t_a2a >= 0.0, got {t.t_a2a}"
 
 
 def test_computation_energy_all_stages():
@@ -372,8 +372,8 @@ def test_deterministic_smoke_phase3():
         prev_generated = env._episode_tasks_generated
         prev_completed = env._episode_tasks_completed
 
-        # A2A remains exactly 0
-        assert info["a2a_latency"] == 0.0
+        # A2A was exactly 0 in Phase 3, now positive in Phase 4
+        assert info["a2a_latency"] >= 0.0
 
     # Invariant: completed <= generated
     assert env._episode_tasks_completed <= env._episode_tasks_generated
@@ -383,7 +383,7 @@ def test_deterministic_smoke_phase3():
     for t in env.completed_tasks:
         recon = t.t_upload + sum(s.t_queue for s in t.stages) + sum(s.t_compute for s in t.stages) + t.t_a2a
         np.testing.assert_allclose(t.t_total, recon, rtol=1e-9, atol=1e-9)
-        assert t.t_a2a == 0.0
+        assert t.t_a2a > 0.0
         assert t.stages[0].uav_id == 0
         assert t.stages[1].uav_id == 1
         assert t.stages[2].uav_id == 2

@@ -265,7 +265,7 @@ UAV_ALT_DELTA_MAX = 10.0
 # Incremental research simulator. Phase 1 is a minimal environment:
 # stationary IoT users, mobile UAVs, A2G uplink, queues, compute, energy.
 # Later phases add service chains, A2A, caching/replication, two-timescale RL.
-SIMULATOR_PHASE = 3
+SIMULATOR_PHASE = 5
 
 # Observation: how many nearest users are packed into each UAV obs vector.
 PHASE1_OBS_USERS = 10

@@ -90,6 +90,8 @@ class UAV:
         self.upload_buffer = deque()
         self.active_upload = None
         self.computing = None
+        self.cache_capacity = float(profile.get("cache_capacity", 100.0)) if profile else 100.0
+        self.service_cache = set()
         if profile is not None:
             self.cpu_freq = profile["cpu_freq"]
             self.bandwidth = profile["bandwidth"]
@@ -126,14 +128,16 @@ class UAV:
 
 class ServiceStage:
     """
-    Single stage in an ordered service chain (Phase 3).
+    Single stage in an ordered service chain (Phase 3/4).
     """
 
-    def __init__(self, name, uav_id, cpu_cycles):
+    def __init__(self, name, uav_id, cpu_cycles, output_data_size_bits=None):
         self.name = str(name)
         self.uav_id = int(uav_id)
         self.cpu_cycles = float(cpu_cycles)
         self.remaining_cycles = float(cpu_cycles)
+        # Intermediate/output data size for A2A transition (Phase 4)
+        self.output_data_size_bits = float(output_data_size_bits) if output_data_size_bits is not None else 0.0
         self.enqueue_time = None
         self.compute_start_time = None
         self.compute_finish_time = None
@@ -142,6 +146,9 @@ class ServiceStage:
         self.queue_wait = 0.0
         self.t_queue = 0.0
         self.t_compute = 0.0
+        self.t_a2a = 0.0      # Explicit A2A latency for this stage transition
+        self.a2a_rate = 0.0   # A2A rate used for the transition
+        self.a2a_distance = 0.0
         self.energy = 0.0
         self.status = "pending"  # pending -> queued -> computing -> completed
 
@@ -172,7 +179,7 @@ class Task:
         self.t_upload = 0.0
         self.t_queue = 0.0
         self.t_compute = 0.0
-        self.t_a2a = 0.0
+        self._t_a2a = 0.0
         self.t_total = 0.0
         # Channel snapshot at last active upload slot
         self.last_a2g_distance = 0.0
@@ -193,14 +200,22 @@ class Task:
         self.current_stage_idx = 0
         n_stages = max(len(c), 1)
         stage_cyc = self.cpu_cycles / n_stages
+        # Default intermediate data size to task data size (Phase 4)
+        stage_data = self.data_size_bits
         self.stages = [
             ServiceStage(
                 name=s_name,
                 uav_id=p.get(s_name, idx % MAX_UAVS),
                 cpu_cycles=stage_cyc,
+                output_data_size_bits=stage_data,
             )
             for idx, s_name in enumerate(self.chain)
         ]
+
+    @property
+    def t_a2a(self):
+        """Total A2A latency is the sum of stage transition delays (Phase 4)."""
+        return sum(s.t_a2a for s in self.stages)
 
     @property
     def current_stage(self):
@@ -259,7 +274,8 @@ class MultiUAVMECEnv:
     def __init__(self, num_users=NUM_USERS, num_uavs=NUM_UAVS,
                  num_jammers=0, seed=42, domain_cfg=None,
                  task_gen_prob=None, service_chain=None,
-                 service_placement=None):
+                 service_placement=None, service_sizes=None,
+                 initial_replicas=None):
         self.rng = np.random.RandomState(seed)
         self.base_seed = seed
         merged = {
@@ -282,6 +298,8 @@ class MultiUAVMECEnv:
             DEFAULT_SERVICE_CHAIN if service_chain is None else service_chain)
         self.service_placement = dict(
             DEFAULT_SERVICE_PLACEMENT if service_placement is None else service_placement)
+        self.service_sizes = dict(service_sizes) if service_sizes is not None else {s: 20.0 for s in self.service_chain}
+        self.initial_replicas = initial_replicas
 
         # Stubs so leftover DMJO tooling does not crash on attribute access.
         self.num_jammers = 0
@@ -306,12 +324,18 @@ class MultiUAVMECEnv:
         self._slot_generated = 0
         self._slot_completed = []
         self._slot_deadline_misses = 0
+        self._slot_cache_local_hits = 0
+        self._slot_cache_coop_hits = 0
+        self._slot_cache_misses = 0
 
         # Phase-2: episode-level accumulators for percentile latency and stats
         self._episode_latencies: list = []
         self._episode_tasks_generated = 0
         self._episode_tasks_completed = 0
         self._episode_deadline_misses = 0
+        self._episode_cache_local_hits = 0
+        self._episode_cache_coop_hits = 0
+        self._episode_cache_misses = 0
 
     # ----------------------------------------------------------
     # Construction
@@ -331,6 +355,18 @@ class MultiUAVMECEnv:
             r = self.area_radius * 0.5
             pos = (r * np.cos(angle), r * np.sin(angle), profile["altitude"])
             self.uavs.append(UAV(i, pos, profile=profile))
+
+        # Phase-5: Initial deterministic service placement
+        for service, uav_id in self.service_placement.items():
+            if uav_id < self.num_uavs:
+                self.uavs[uav_id].service_cache.add(service)
+
+        # Apply configurable initial replicas if provided
+        if self.initial_replicas is not None:
+            for u_id, services in self.initial_replicas.items():
+                if int(u_id) < self.num_uavs:
+                    for s_name in services:
+                        self.replicate_service(int(u_id), s_name)
 
     def _sim_time(self):
         return self.t * SLOT_DURATION
@@ -376,6 +412,16 @@ class MultiUAVMECEnv:
     def calculate_a2g_distance(self, user_pos, uav_pos):
         return calculate_a2g_distance(user_pos, uav_pos)
 
+    def calculate_a2a_distance(self, uav1_pos, uav2_pos):
+        return calculate_a2g_distance(uav1_pos, uav2_pos)
+
+    def calculate_a2a_rate(self, uav1, uav2):
+        pos1 = uav1.position if hasattr(uav1, 'position') else uav1
+        pos2 = uav2.position if hasattr(uav2, 'position') else uav2
+        tx_p = uav1.tx_power if hasattr(uav1, 'tx_power') else 0.01
+        from config import A2A_BANDWIDTH
+        return self.channel.a2a_rate(pos1, pos2, tx_power=tx_p, bandwidth=A2A_BANDWIDTH, noise_psd=NOISE_PSD)
+
     def calculate_a2g_rate(self, user, uav):
         return self.channel.a2g_uplink_rate(
             user.position, uav.position, user.tx_power, uav.bandwidth, NOISE_PSD)
@@ -391,6 +437,68 @@ class MultiUAVMECEnv:
 
     def calculate_a2a_latency(self, *args, **kwargs):
         return calculate_a2a_latency(*args, **kwargs)
+
+    def replicate_service(self, uav_id, service_name):
+        """Phase-5: Replicate service to UAV cache if space permits."""
+        uav = self.uavs[uav_id]
+        size = self.service_sizes.get(service_name, 20.0)
+        current_used = sum(self.service_sizes.get(s, 20.0) for s in uav.service_cache)
+        if current_used + size <= uav.cache_capacity:
+            if service_name not in uav.service_cache:
+                uav.service_cache.add(service_name)
+                return True
+        return False
+
+    def evict_service(self, uav_id, service_name):
+        """Phase-5: Evict service from UAV cache."""
+        uav = self.uavs[uav_id]
+        if service_name in uav.service_cache:
+            uav.service_cache.remove(service_name)
+            return True
+        return False
+
+    def select_best_uav_for_stage(self, task, stage_idx):
+        """Phase-5: Select best candidate UAV (minimum A2A distance) hosting service."""
+        st = task.stages[stage_idx]
+        service = st.name
+
+        # Source UAV: previous stage UAV, or assigned upload UAV for stage 0
+        source_uav_id = task.assigned_uav_id if stage_idx == 0 else task.stages[stage_idx - 1].uav_id
+        source_uav = self.uavs[source_uav_id]
+
+        # Find all active UAVs with service in cache and battery > 0
+        candidates = []
+        for uav in self._active_uavs():
+            if uav.battery_energy > 0.0 and service in uav.service_cache:
+                candidates.append(uav)
+
+        # Track hit/miss metrics
+        if not candidates:
+            self._slot_cache_misses += 1
+            self._episode_cache_misses += 1
+            # Fallback to deterministic default placement
+            return st.uav_id
+
+        # Check if source UAV itself has the service (local hit)
+        if any(c.id == source_uav_id for c in candidates):
+            self._slot_cache_local_hits += 1
+            self._episode_cache_local_hits += 1
+            return source_uav_id
+
+        # Otherwise, cooperative hit
+        self._slot_cache_coop_hits += 1
+        self._episode_cache_coop_hits += 1
+
+        # Select closest candidate
+        best_uav = None
+        min_dist = float('inf')
+        for cand in candidates:
+            dist = self.calculate_a2a_distance(source_uav.position, cand.position)
+            if dist < min_dist:
+                min_dist = dist
+                best_uav = cand
+
+        return best_uav.id
 
     def calculate_total_latency(self, t_upload, t_queue, t_compute, t_a2a=0.0):
         return calculate_total_latency(t_upload, t_queue, t_compute, t_a2a)
@@ -570,6 +678,9 @@ class MultiUAVMECEnv:
         self._slot_generated = 0
         self._slot_completed = []
         self._slot_deadline_misses = 0
+        self._slot_cache_local_hits = 0
+        self._slot_cache_coop_hits = 0
+        self._slot_cache_misses = 0
 
         e_flight = np.zeros(MAX_UAVS)
         e_comm = np.zeros(MAX_UAVS)
@@ -578,7 +689,7 @@ class MultiUAVMECEnv:
         self._move_uavs(actions, e_flight)
         self._generate_tasks(now)
         self._process_uploads(now, e_comm)
-        self._process_compute(now, e_comp)
+        self._process_compute(now, e_comp, e_comm)
 
         e_total_vec = e_flight + e_comm + e_comp
         for i, uav in enumerate(self._active_uavs()):
@@ -693,13 +804,17 @@ class MultiUAVMECEnv:
                 if task in user.pending_tasks:
                     user.pending_tasks.remove(task)
 
-                # Phase-3: Enqueue for Stage 0 on its destination UAV (e.g. UAV0 for 'A')
+                # Phase-5: Enqueue for Stage 0 using dynamic caching / replication selection
                 st0 = task.stages[0]
+                st0.uav_id = self.select_best_uav_for_stage(task, 0)
+                st0.t_a2a = 0.0
+                st0.a2a_rate = float('inf')
+                st0.a2a_distance = 0.0
                 st0.enqueue_time = now
                 st0.status = "queued"
                 self.uavs[st0.uav_id].task_queue.append(task)
 
-    def _process_compute(self, now, e_comp):
+    def _process_compute(self, now, e_comp, e_comm):
         stages_to_forward = []
 
         for uav in self._active_uavs():
@@ -775,7 +890,33 @@ class MultiUAVMECEnv:
                     # Advance stage
                     task.current_stage_idx += 1
                     if task.current_stage_idx < len(task.stages):
+                        prev_st = task.stages[task.current_stage_idx - 1]
                         next_st = task.stages[task.current_stage_idx]
+
+                        # Phase-5: Select best candidate UAV hosting the required service
+                        next_st.uav_id = self.select_best_uav_for_stage(task, task.current_stage_idx)
+
+                        # Phase 4/5 A2A logic: transition between consecutive stages on different UAVs
+                        if prev_st.uav_id != next_st.uav_id:
+                            uav1 = self.uavs[prev_st.uav_id]
+                            uav2 = self.uavs[next_st.uav_id]
+                            r_a2a = self.calculate_a2a_rate(uav1, uav2)
+                            d_inter = prev_st.output_data_size_bits
+                            t_a2a_val = calculate_a2a_latency(d_inter, r_a2a)
+                            next_st.t_a2a = t_a2a_val
+                            next_st.a2a_rate = r_a2a
+                            next_st.a2a_distance = self.calculate_a2a_distance(uav1.position, uav2.position)
+
+                            # Account A2A communication energy separately
+                            tx_energy = uav1.tx_power * t_a2a_val
+                            rx_energy = PHASE1_UAV_RX_POWER_W * t_a2a_val
+                            e_comm[uav1.id] += tx_energy
+                            e_comm[uav2.id] += rx_energy
+                        else:
+                            next_st.t_a2a = 0.0
+                            next_st.a2a_rate = float('inf')
+                            next_st.a2a_distance = 0.0
+
                         next_st.enqueue_time = now
                         next_st.status = "queued"
                         task.status = "queued"
@@ -785,7 +926,6 @@ class MultiUAVMECEnv:
                         task.compute_finish_time = now
                         task.t_queue = sum(s.t_queue for s in task.stages)
                         task.t_compute = sum(s.t_compute for s in task.stages)
-                        task.t_a2a = calculate_a2a_latency()
                         task.t_total = calculate_total_latency(
                             task.t_upload, task.t_queue, task.t_compute, task.t_a2a)
                         task.deadline_missed = (task.t_total > task.deadline)
@@ -807,12 +947,23 @@ class MultiUAVMECEnv:
             mean_upload = float(np.mean([t.t_upload for t in completed]))
             mean_queue  = float(np.mean([t.t_queue  for t in completed]))
             mean_comp   = float(np.mean([t.t_compute for t in completed]))
+            mean_a2a    = float(np.mean([t.t_a2a    for t in completed]))
             mean_total  = float(np.mean([t.t_total  for t in completed]))
             mean_rate   = float(np.mean([t.last_a2g_rate     for t in completed]))
             mean_dist   = float(np.mean([t.last_a2g_distance for t in completed]))
+
+            all_a2a_rates = []
+            all_a2a_dists = []
+            for t in completed:
+                for s in t.stages:
+                    if s.t_a2a > 0.0:
+                        all_a2a_rates.append(s.a2a_rate)
+                        all_a2a_dists.append(s.a2a_distance)
+            mean_a2a_rate = float(np.mean(all_a2a_rates)) if all_a2a_rates else 0.0
+            mean_a2a_dist = float(np.mean(all_a2a_dists)) if all_a2a_dists else 0.0
         else:
-            mean_upload = mean_queue = mean_comp = mean_total = 0.0
-            mean_rate = mean_dist = 0.0
+            mean_upload = mean_queue = mean_comp = mean_a2a = mean_total = 0.0
+            mean_rate = mean_dist = mean_a2a_rate = mean_a2a_dist = 0.0
 
         fleet_energy = float(np.sum(e_total_vec[:self.num_active]))
         # Reward: -(α L̃ + β Ẽ)
@@ -856,6 +1007,13 @@ class MultiUAVMECEnv:
         e_co  = float(np.sum(e_comm[:self.num_active]))
         e_cp  = float(np.sum(e_comp[:self.num_active]))
 
+        # Phase-5: replica metrics
+        replica_counts = {}
+        for service in self.service_chain:
+            count = sum(1 for u in self._active_uavs() if service in u.service_cache)
+            replica_counts[service] = count
+        avg_replicas = float(np.mean(list(replica_counts.values()))) if replica_counts else 0.0
+
         info = {
             # ---- slot-level task counters (Phase-1 + Phase-2 keys) ----
             "num_tasks_generated": self._slot_generated,
@@ -875,13 +1033,15 @@ class MultiUAVMECEnv:
             "chain_p50_latency":        p50,
             "chain_p95_latency":        p95,
             "chain_p99_latency":        p99,
-            # ---- latency breakdown (slot average) ----
+            # ---- latency breakdown (slot average, Phase 4) ----
             "upload_latency":  mean_upload,
             "queue_latency":   mean_queue,
             "compute_latency": mean_comp,
-            "a2a_latency":     0.0,
+            "a2a_latency":     mean_a2a,
             "total_latency":   mean_total,
             "avg_latency":     mean_total,
+            "a2a_rate":        mean_a2a_rate,
+            "a2a_distance":    mean_a2a_dist,
             # ---- percentile latency (episode, Phase-2) ----
             "p50_latency": p50,
             "p95_latency": p95,
@@ -908,13 +1068,20 @@ class MultiUAVMECEnv:
             # ---- simulation state ----
             "time_slot":       self.t,
             "num_active_uavs": self.num_active,
+            # ---- Phase-5: Caching & Replication Metrics ----
+            "cache_local_hits":          self._slot_cache_local_hits,
+            "cache_coop_hits":           self._slot_cache_coop_hits,
+            "cache_misses":              self._slot_cache_misses,
+            "episode_cache_local_hits":  self._episode_cache_local_hits,
+            "episode_cache_coop_hits":   self._episode_cache_coop_hits,
+            "episode_cache_misses":      self._episode_cache_misses,
+            "replica_count":             avg_replicas,
+            "replica_counts":            replica_counts,
             # ---- compatibility stubs (DMJO legacy) ----
             "noma_pairs_formed": 0,
             "jammer_blocked":    0,
             "wind_speed":        0.0,
             "wind_direction":    0.0,
-            "cache_local_hits":  0,
-            "cache_coop_hits":   0,
-            "cache_bs_fetches":  0,
+            "cache_bs_fetches":          self._slot_cache_misses,
         }
         return rewards, info

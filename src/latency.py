@@ -34,11 +34,13 @@ def calculate_compute_latency(cpu_cycles, allocated_cpu_hz):
     return float(cpu_cycles) / max(float(allocated_cpu_hz), 1e-12)
 
 
-def calculate_a2a_latency(*_args, **_kwargs):
-    """Placeholder for Phase 4. Always 0 in Phase 1."""
-    return 0.0
+def calculate_a2a_latency(data_size_bits=0.0, rate_bps=1e9):
+    """T_A2A = data_size_bits / R_A2A (Phase 4)."""
+    if rate_bps is None or rate_bps <= 0:
+        return 0.0
+    return float(data_size_bits) / max(float(rate_bps), 1e-12)
 
 
 def calculate_total_latency(t_upload, t_queue, t_compute, t_a2a=0.0):
-    """End-to-end latency. t_a2a is unused until Phase 4."""
+    """End-to-end latency including A2A transmission."""
     return float(t_upload) + float(t_queue) + float(t_compute) + float(t_a2a)
