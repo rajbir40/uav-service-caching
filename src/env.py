@@ -40,6 +40,7 @@ from config import (
     ALPHA_LATENCY, BETA_ENERGY, EFFECTIVE_CAPACITANCE,
     PHASE1_OBS_USERS, PHASE1_UAV_BATTERY_J, PHASE1_LAT_NORM,
     PHASE1_ENERGY_NORM, PHASE1_UAV_RX_POWER_W, PHASE1_ACTION_DIM,
+    DEFAULT_SERVICE_CHAIN, DEFAULT_SERVICE_PLACEMENT,
     dbm_to_watt,
 )
 from src.channel_model import ChannelModel
@@ -123,10 +124,33 @@ class UAV:
         ], dtype=np.float32)
 
 
+class ServiceStage:
+    """
+    Single stage in an ordered service chain (Phase 3).
+    """
+
+    def __init__(self, name, uav_id, cpu_cycles):
+        self.name = str(name)
+        self.uav_id = int(uav_id)
+        self.cpu_cycles = float(cpu_cycles)
+        self.remaining_cycles = float(cpu_cycles)
+        self.enqueue_time = None
+        self.compute_start_time = None
+        self.compute_finish_time = None
+        self.compute_elapsed = 0.0
+        self.upload_buffer_wait = 0.0
+        self.queue_wait = 0.0
+        self.t_queue = 0.0
+        self.t_compute = 0.0
+        self.energy = 0.0
+        self.status = "pending"  # pending -> queued -> computing -> completed
+
+
 class Task:
     _next_id = 0
 
-    def __init__(self, user_id, arrival_time, data_size_bits, cpu_cycles, deadline):
+    def __init__(self, user_id, arrival_time, data_size_bits, cpu_cycles, deadline,
+                 chain=None, placement=None):
         self.task_id = Task._next_id
         Task._next_id += 1
         self.user_id = user_id
@@ -161,6 +185,28 @@ class Task:
         self.deadline_missed = False      # True if t_total > deadline
         # Lifecycle status
         self.status = "generated"
+
+        # Phase-3: Service Chain
+        c = list(DEFAULT_SERVICE_CHAIN if chain is None else chain)
+        p = dict(DEFAULT_SERVICE_PLACEMENT if placement is None else placement)
+        self.chain = c
+        self.current_stage_idx = 0
+        n_stages = max(len(c), 1)
+        stage_cyc = self.cpu_cycles / n_stages
+        self.stages = [
+            ServiceStage(
+                name=s_name,
+                uav_id=p.get(s_name, idx % MAX_UAVS),
+                cpu_cycles=stage_cyc,
+            )
+            for idx, s_name in enumerate(self.chain)
+        ]
+
+    @property
+    def current_stage(self):
+        if 0 <= self.current_stage_idx < len(self.stages):
+            return self.stages[self.current_stage_idx]
+        return None
 
     @classmethod
     def reset_ids(cls):
@@ -212,7 +258,8 @@ class MultiUAVMECEnv:
 
     def __init__(self, num_users=NUM_USERS, num_uavs=NUM_UAVS,
                  num_jammers=0, seed=42, domain_cfg=None,
-                 task_gen_prob=None):
+                 task_gen_prob=None, service_chain=None,
+                 service_placement=None):
         self.rng = np.random.RandomState(seed)
         self.base_seed = seed
         merged = {
@@ -231,6 +278,10 @@ class MultiUAVMECEnv:
         self.area_radius = float(self.domain_cfg.get("area_radius", AREA_RADIUS))
         self.task_gen_prob = (TASK_GENERATION_PROB if task_gen_prob is None
                               else float(task_gen_prob))
+        self.service_chain = list(
+            DEFAULT_SERVICE_CHAIN if service_chain is None else service_chain)
+        self.service_placement = dict(
+            DEFAULT_SERVICE_PLACEMENT if service_placement is None else service_placement)
 
         # Stubs so leftover DMJO tooling does not crash on attribute access.
         self.num_jammers = 0
@@ -596,6 +647,8 @@ class MultiUAVMECEnv:
                 data_size_bits=float(sizes[i]),
                 cpu_cycles=float(cycles[i]),
                 deadline=float(deadlines[i]),
+                chain=self.service_chain,
+                placement=self.service_placement,
             )
             # Phase-2: associate_task returns None if all UAVs are depleted
             assigned = self.associate_task(task)
@@ -636,61 +689,117 @@ class MultiUAVMECEnv:
                 task.t_upload = inst if inst <= SLOT_DURATION else task.upload_elapsed
                 task.enqueue_time = now
                 task.status = "queued"
-                uav.task_queue.append(task)
                 uav.active_upload = None
                 if task in user.pending_tasks:
                     user.pending_tasks.remove(task)
 
+                # Phase-3: Enqueue for Stage 0 on its destination UAV (e.g. UAV0 for 'A')
+                st0 = task.stages[0]
+                st0.enqueue_time = now
+                st0.status = "queued"
+                self.uavs[st0.uav_id].task_queue.append(task)
+
     def _process_compute(self, now, e_comp):
+        stages_to_forward = []
+
         for uav in self._active_uavs():
-            if uav.computing is None and uav.task_queue:
-                task = uav.task_queue.popleft()
-                task.compute_start_time = now
-                task.allocated_cpu_hz = uav.cpu_freq
-                # Phase-2: t_queue = upload-buffer wait + CPU-queue wait
-                #   upload_buffer_wait = upload_start_time - arrival_time
-                #   cpu_queue_wait     = compute_start_time - upload_finish_time
-                # This ensures t_total = t_upload + t_queue + t_compute exactly.
-                upload_buffer_wait = max(
-                    0.0,
-                    (task.upload_start_time - task.arrival_time)
-                    if task.upload_start_time is not None else 0.0,
-                )
-                cpu_queue_wait = max(
-                    0.0,
-                    (task.compute_start_time - task.upload_finish_time)
-                    if task.upload_finish_time is not None else 0.0,
-                )
-                task.t_queue = upload_buffer_wait + cpu_queue_wait
-                task.status = "computing"
-                uav.computing = task
-
-            task = uav.computing
-            if task is None:
+            if uav.battery_energy <= 0.0:
                 continue
-            cycles = uav.cpu_freq * SLOT_DURATION
-            processed = min(task.remaining_cycles, cycles)
-            task.remaining_cycles -= processed
-            task.compute_elapsed += SLOT_DURATION
-            e_comp[uav.id] += computation_energy(uav.cpu_freq, processed)
 
-            if task.remaining_cycles <= 1e-6:
-                # Phase-2: wall-clock compute finish time
-                task.compute_finish_time = now
-                closed = calculate_compute_latency(task.cpu_cycles, uav.cpu_freq)
-                task.t_compute = closed if closed <= SLOT_DURATION else task.compute_elapsed
-                task.t_a2a = calculate_a2a_latency()
-                # t_total = sum of components — identity holds by construction
-                task.t_total = calculate_total_latency(
-                    task.t_upload, task.t_queue, task.t_compute, task.t_a2a)
-                # Phase-2: deadline check
-                task.deadline_missed = (task.t_total > task.deadline)
-                if task.deadline_missed:
-                    self._slot_deadline_misses += 1
-                task.status = "completed"
-                self.completed_tasks.append(task)
-                self._slot_completed.append(task)
-                uav.computing = None
+            cycles_left = uav.cpu_freq * SLOT_DURATION
+            queue_len_start = len(uav.task_queue)
+            tasks_popped = 0
+
+            while cycles_left > 1e-6:
+                if uav.computing is None:
+                    if tasks_popped >= queue_len_start or not uav.task_queue:
+                        break
+                    task = uav.task_queue.popleft()
+                    tasks_popped += 1
+                    st = task.current_stage
+                    if st is None:
+                        continue
+                    st.compute_start_time = now
+                    task.allocated_cpu_hz = uav.cpu_freq
+                    if task.current_stage_idx == 0:
+                        task.compute_start_time = now
+                        upload_buffer_wait = max(
+                            0.0,
+                            (task.upload_start_time - task.arrival_time)
+                            if task.upload_start_time is not None else 0.0,
+                        )
+                        cpu_queue_wait = max(
+                            0.0,
+                            (st.compute_start_time - st.enqueue_time)
+                            if st.enqueue_time is not None else 0.0,
+                        )
+                        st.upload_buffer_wait = upload_buffer_wait
+                        st.queue_wait = cpu_queue_wait
+                        st.t_queue = upload_buffer_wait + cpu_queue_wait
+                    else:
+                        st.upload_buffer_wait = 0.0
+                        st.queue_wait = max(
+                            0.0,
+                            (st.compute_start_time - st.enqueue_time)
+                            if st.enqueue_time is not None else 0.0,
+                        )
+                        st.t_queue = st.queue_wait
+                    st.status = "computing"
+                    task.status = "computing"
+                    uav.computing = task
+
+                task = uav.computing
+                st = task.current_stage
+                if st is None:
+                    uav.computing = None
+                    continue
+
+                processed = min(st.remaining_cycles, cycles_left)
+                st.remaining_cycles = max(0.0, st.remaining_cycles - processed)
+                task.remaining_cycles = max(0.0, task.remaining_cycles - processed)
+                st.compute_elapsed += SLOT_DURATION
+                task.compute_elapsed += SLOT_DURATION
+                cycles_left -= processed
+                energy = computation_energy(uav.cpu_freq, processed)
+                e_comp[uav.id] += energy
+                st.energy += energy
+
+                if st.remaining_cycles <= 1e-6:
+                    st.remaining_cycles = 0.0
+                    st.compute_finish_time = now
+                    closed = calculate_compute_latency(st.cpu_cycles, uav.cpu_freq)
+                    st.t_compute = closed if closed <= SLOT_DURATION else st.compute_elapsed
+                    st.status = "completed"
+                    uav.computing = None
+
+                    # Advance stage
+                    task.current_stage_idx += 1
+                    if task.current_stage_idx < len(task.stages):
+                        next_st = task.stages[task.current_stage_idx]
+                        next_st.enqueue_time = now
+                        next_st.status = "queued"
+                        task.status = "queued"
+                        stages_to_forward.append((next_st.uav_id, task))
+                    else:
+                        # Chain completed
+                        task.compute_finish_time = now
+                        task.t_queue = sum(s.t_queue for s in task.stages)
+                        task.t_compute = sum(s.t_compute for s in task.stages)
+                        task.t_a2a = calculate_a2a_latency()
+                        task.t_total = calculate_total_latency(
+                            task.t_upload, task.t_queue, task.t_compute, task.t_a2a)
+                        task.deadline_missed = (task.t_total > task.deadline)
+                        if task.deadline_missed:
+                            self._slot_deadline_misses += 1
+                        task.status = "completed"
+                        self.completed_tasks.append(task)
+                        self._slot_completed.append(task)
+                else:
+                    break
+
+        # 3. Transfer completed stages to destination queues (available next slot)
+        for dest_uav_id, task in stages_to_forward:
+            self.uavs[dest_uav_id].task_queue.append(task)
 
     def _pack_reward_info(self, e_flight, e_comm, e_comp, e_total_vec):
         completed = self._slot_completed
@@ -720,8 +829,10 @@ class MultiUAVMECEnv:
             p50 = float(np.percentile(arr, 50))
             p95 = float(np.percentile(arr, 95))
             p99 = float(np.percentile(arr, 99))
+            chain_avg_lat = float(np.mean(arr))
         else:
             p50 = p95 = p99 = 0.0
+            chain_avg_lat = 0.0
 
         # Phase-2: pending tasks across all active UAVs
         tasks_pending = int(sum(
@@ -757,6 +868,13 @@ class MultiUAVMECEnv:
             "episode_tasks_generated":  self._episode_tasks_generated,
             "episode_tasks_completed":  self._episode_tasks_completed,
             "episode_deadline_misses":  self._episode_deadline_misses,
+            # ---- Phase-3: chain metrics ----
+            "chains_completed":         len(completed),
+            "episode_chains_completed": self._episode_tasks_completed,
+            "chain_avg_latency":        chain_avg_lat,
+            "chain_p50_latency":        p50,
+            "chain_p95_latency":        p95,
+            "chain_p99_latency":        p99,
             # ---- latency breakdown (slot average) ----
             "upload_latency":  mean_upload,
             "queue_latency":   mean_queue,

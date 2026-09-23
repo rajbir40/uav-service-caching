@@ -265,7 +265,7 @@ UAV_ALT_DELTA_MAX = 10.0
 # Incremental research simulator. Phase 1 is a minimal environment:
 # stationary IoT users, mobile UAVs, A2G uplink, queues, compute, energy.
 # Later phases add service chains, A2A, caching/replication, two-timescale RL.
-SIMULATOR_PHASE = 1
+SIMULATOR_PHASE = 3
 
 # Observation: how many nearest users are packed into each UAV obs vector.
 PHASE1_OBS_USERS = 10
@@ -284,3 +284,16 @@ PHASE1_UAV_RX_POWER_W = 0.5
 
 # Keep MAPPO action width (dx, dy, dh, pad, pad). Only dx/dy/dh are used.
 PHASE1_ACTION_DIM = 5
+
+# ============================================================
+# 14. PHASE-3 SERVICE CHAINS
+# ============================================================
+# Ordered service-chain execution with fixed deterministic placement
+# and zero A2A latency.
+DEFAULT_SERVICE_CHAIN = ["A", "B", "C"]
+DEFAULT_SERVICE_PLACEMENT = {
+    "A": 0,
+    "B": 1,
+    "C": 2,
+}
+

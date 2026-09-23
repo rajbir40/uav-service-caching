@@ -105,7 +105,7 @@ Implemented. See `PHASE_2.md`.
 
 ### Phase 3 — Service Chains
 
-NEXT.
+Implemented. See `PHASE_3.md`.
 
 Add ordered service-chain execution but NO A2A delay yet.
 
@@ -157,7 +157,8 @@ Diffusion or other improvements only if justified later.
 
 Phase 1: PASS
 Phase 2: PASS
-Phase 3: NEXT
+Phase 3: PASS
+Phase 4: NEXT
 
 ## Development Rule
 
