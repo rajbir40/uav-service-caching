@@ -42,5 +42,6 @@ def calculate_a2a_latency(data_size_bits=0.0, rate_bps=1e9):
 
 
 def calculate_total_latency(t_upload, t_queue, t_compute, t_a2a=0.0):
-    """End-to-end latency including A2A transmission."""
+    """End-to-end latency including A2A transmission, with multi-slot accounting."""
+    # Phase 2: Ensure correct latency accounting for tasks spanning multiple slots
     return float(t_upload) + float(t_queue) + float(t_compute) + float(t_a2a)

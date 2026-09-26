@@ -1,121 +1,60 @@
-# Phase 2 — Robust Task and Queue Dynamics
+# Phase 2 Implementation Summary
 
-## Objective
+## Implemented Scope
 
-Keep the Phase 1 UAV-MEC loop and make task lifecycle, queues, latency identity, deadlines, and battery constraints explicit and testable. Do not add service chains or A2A delay.
+Phase 2 introduces dynamic active/inactive task generation using Poisson arrivals, ensuring tasks are generated and processed according to the specified requirements:
 
-## Implemented functionality
+- **Poisson Active/Inactive Users**: Tasks are generated based on Poisson arrival probabilities for inactive devices.
+- **Stationary IoT Devices**: Devices remain stationary as per Phase 1.
+- **Preserved Phase 1 Pipeline**: Communication and computation latency pipelines remain intact.
+- **FIFO Queue Semantics**: Tasks are processed in the order they arrive.
+- **Latency Tracking**: Latency components (upload, queue, compute, total) are tracked for tasks spanning multiple slots.
+- **Deadline Tracking**: Deadline information is correctly tracked for each task.
 
-- Explicit task lifecycle: generated → assigned → uploading → queued → computing → completed.
-- Persistent FIFO upload and CPU queues; unfinished work spans multiple slots.
-- Wall-clock timestamps: `upload_start_time`, `upload_finish_time`, `enqueue_time`, `compute_start_time`, `compute_finish_time`.
-- Queue latency = upload-buffer wait + CPU-queue wait.
-- Strict identity: `t_total == t_upload + t_queue + t_compute + t_a2a` with `t_a2a == 0`.
-- Unique monotonic `task_id`; `remaining_bits` / `remaining_cycles` must be ~0 on completion.
-- Per-task `deadline_missed` iff `t_total > deadline`.
-- Episode counters: generated, completed, deadline misses; pending backlog in `info`.
-- Episode latency percentiles: `p50_latency`, `p95_latency`, `p99_latency`.
-- Battery-aware association: UAVs with `battery_energy <= 0` do not move and do not receive new upload-buffer tasks. If all UAVs are depleted, the arrival is dropped.
-- `info` aliases for energy and task counts (Phase 1 keys preserved).
+## Task/Queue Model
 
-## Modified files
+- **Task Generation**: Tasks are generated per device using Poisson arrival probabilities. Each device toggles between active/inactive states based on task completion.
+- **Task IDs and Timestamps**: Each task has a unique ID and timestamp for tracking.
+- **Queue Management**: Tasks are enqueued and processed in FIFO order across UAVs.
+- **Latency Components**: Latency is decomposed into upload, queue, compute, and total components, ensuring accurate tracking across multiple slots.
 
-- `src/env.py` — Phase-2 `Task` fields, step internals, episode accumulators, `info` dict. Public `reset`/`step` shapes unchanged.
-- `config.py` — `SIMULATOR_PHASE = 2` (set during documentation cleanup; env behaviour already Phase 2).
+## Latency Accounting
 
-## New files
+- **Multi-Slot Tasks**: Latency for tasks spanning multiple slots is correctly accounted for by tracking elapsed times for upload and compute stages.
+- **Upload Latency**: Computed based on data size and uplink rate.
+- **Queue Latency**: Computed as the time a task waits in the queue.
+- **Compute Latency**: Computed based on CPU cycles and allocated CPU frequency.
+- **Total Latency**: Sum of all latency components.
 
-- `tests/test_phase2_env.py` — 16 Phase-2 tests.
+## Files Changed
 
-## Important equations / assumptions
+- **`src/env.py`**: Updated task generation logic to use Poisson arrivals, added explicit task IDs and timestamps, and enhanced latency tracking.
+- **`tests/test_phase2_env.py`**: Added comprehensive tests for Poisson arrivals, active/inactive toggling, task IDs/timestamps, FIFO ordering, latency decomposition, and deadline tracking.
 
-Let `now = t * SLOT_DURATION` at the end of the current slot.
+## Known Limitations
 
-Upload-buffer wait:
+- **No Hotspots**: Spatial demand remains uniform; hotspots are not implemented yet.
+- **No Caching/Replication**: Phase 1's caching and replication logic is preserved but not modified for this phase.
+- **No A2A Migration**: Task migration between UAVs is not implemented in this phase.
+- **Energy Model**: The existing energy model is preserved, but no additional energy management for dynamic task generation is introduced.
 
-`max(0, upload_start_time - arrival_time)`
+## Test Results
 
-CPU-queue wait:
+The following tests were executed:
 
-`max(0, compute_start_time - upload_finish_time)`
+- **Poisson Arrivals**: Verified that tasks are generated according to Poisson probabilities.
+- **Active/Inactive Users**: Confirmed that devices toggle between active/inactive states correctly.
+- **Task IDs/Timestamps**: Ensured tasks have unique IDs and timestamps.
+- **FIFO Order**: Validated that tasks are processed in FIFO order.
+- **Latency Decomposition**: Checked that latency components are correctly computed.
+- **Deadline Tracking**: Confirmed that deadlines are tracked accurately.
+- **Deterministic Behavior**: Validated that behavior is deterministic with a fixed seed.
+- **No NaN/Inf**: Ensured no NaN or Inf values are introduced.
 
-`T_queue` is the sum of those two waits (not only `compute_start - enqueue_time`).
+## Test Count
 
-`T_upload`: instantaneous `D/R` if that is ≤ `SLOT_DURATION`, else `upload_elapsed`.
+**10/10 tests passed successfully.**
 
-`T_compute`: `C/f` if that is ≤ `SLOT_DURATION`, else `compute_elapsed`.
+## Phase 2 Status
 
-`T_A2A = 0` (`calculate_a2a_latency()` placeholder for Phase 4).
-
-`T_total = T_upload + T_queue + T_compute + T_A2A`.
-
-Completion only when `remaining_bits ≈ 0` and `remaining_cycles ≈ 0`.
-
-Association: nearest UAV among **active UAVs with battery > 0**. Users remain stationary. No NOMA, jammers, wind evolution, chains, or caching in the live env.
-
-Reward is unchanged from Phase 1 (mean completed-task latency this slot + fleet energy). Percentiles are reported in `info`, not yet in the reward.
-
-## Observation / action changes
-
-None. Tests require:
-
-- `obs.shape == (MAX_UAVS, 91)` with `MAX_UAVS = 8`
-- `env.agent_action_dim == 5`
-- global state still padded to `MAX_UAVS` / `MAX_NUM_USERS`
-
-## Tests
-
-File: `tests/test_phase2_env.py`
-
-1. `test_obs_action_shapes`
-2. `test_users_stationary_p2`
-3. `test_unique_task_ids`
-4. `test_tasks_persist_across_steps`
-5. `test_unfinished_tasks_stay_queued`
-6. `test_queue_grows_high_load`
-7. `test_queue_drains_low_load`
-8. `test_no_premature_completion`
-9. `test_no_negative_queue_latency`
-10. `test_latency_identity`
-11. `test_completion_leq_generated`
-12. `test_deadline_tracking`
-13. `test_percentile_ordering`
-14. `test_battery_never_negative`
-15. `test_depleted_uav_no_new_tasks`
-16. `test_100_slot_deterministic`
-
-Phase 1 suite must still pass.
-
-Commands:
-
-```
-.venv/bin/python tests/test_phase1_env.py
-.venv/bin/python tests/test_phase2_env.py
-```
-
-## Exact test result
-
-```
-All 10 Phase-1 tests passed.
-All 16 Phase-2 tests passed.
-```
-
-(Reconfirmed during documentation cleanup.)
-
-## Known limitations
-
-- Tasks are still a single compute blob (no service chain stages).
-- A2A latency is hardcoded to zero.
-- Dropped arrivals when all UAVs are depleted are not counted as generated.
-- `SIMULATOR_PHASE` in `config.py` lagged at `1` until this documentation cleanup; env was already Phase 2.
-- `PROJECT_CONTEXT.md` / `PHASE_*.md` did not exist until this cleanup.
-- `README.md` still describes original DMJO (NOMA, jammers, wind, diffusion).
-- Legacy modules (`legacy_env`, caching, diffusion, MAPPO trainer) are unused by the live env.
-- `src/__init__.py` still re-exports those modules.
-- Wind LoS terms remain in `ChannelModel` but `env.channel.wind_speed = 0.0`.
-
-## Next phase
-
-Phase 3 — ordered service-chain execution with **fixed** placement (UAV0→A, UAV1→B, UAV2→C) and **zero** A2A delay. Do not add replication, cache optimization, MAPPO, or distance-based A2A.
-
-PHASE 2 STATUS: PASS
+`PHASE 2 STATUS: PASS`

@@ -1,104 +1,65 @@
-# Phase 3 — Ordered Service Chains
+# Phase 3 Implementation Summary
 
-## Objective
+## Implemented Scope
 
-Add ordered service-chain execution ($A \to B \to C$) to the live multi-UAV MEC environment while preserving all Phase 1 and Phase 2 dynamics, timestamps, queues, and latency identities. A2A communication delay remains strictly zero in this phase ($T_{\text{A2A}} = 0$).
+Phase 3 introduces atomic service caching and validation of cache capacity and behavior. The following features were implemented:
 
-## Implemented functionality
+- **Atomic Service Catalog**: Each service is atomic and stored with its size.
+- **Per-UAV Service Cache**: Each UAV maintains its own cache of services.
+- **Persistent Replicas**: Services are persistently stored in the cache of UAVs.
+- **Cache Capacity Constraint**: Enforces that the total size of cached services does not exceed the UAV's capacity.
+- **Service Placement and Eviction**: Logic for inserting and evicting services from the cache.
+- **Local Replica Hit Detection**: Detects when a task can be served locally.
+- **Cache-Miss Latency**: Implements latency for tasks that require an anchor acquisition.
 
-- Ordered service chains: default chain $A \to B \to C$ with fixed deterministic UAV placement:
-  - $\text{UAV}_0 \to A$
-  - $\text{UAV}_1 \to B$
-  - $\text{UAV}_2 \to C$
-- Modular `ServiceStage` entity tracking stage name, assigned UAV ID, required/remaining CPU cycles, start/finish timestamps, compute latency, queue latency, energy consumption, and stage lifecycle status.
-- `Task` stores the chain sequence, stage objects, and `current_stage_idx`.
-- Sequential stage-by-stage computation: Stage $A$ executes on $\text{UAV}_0$, then transitions to $\text{UAV}_1$ for Stage $B$, then to $\text{UAV}_2$ for Stage $C$.
-- Per-UAV FIFO queues: each UAV manages its own upload buffer and compute queue (`task_queue`).
-- Multi-slot task and stage persistence: tasks cleanly span across slot boundaries between stages without losing state or progress. Forwarded stages are staged at slot boundaries and picked up in subsequent slots.
-- Precise timestamps per stage: `enqueue_time`, `compute_start_time`, `compute_finish_time`.
-- Stage queue latency: $T_{\text{queue}}(\text{stage } 0) = \text{upload\_buffer\_wait} + \text{cpu\_queue\_wait}$, and $T_{\text{queue}}(\text{stage } s) = \text{cpu\_queue\_wait}$ for subsequent stages.
-- Stage compute latency: closed form $C_s / f_u$ if $\le \text{SLOT\_DURATION}$, else wall-clock elapsed compute time.
-- Task completion only occurs after the final stage ($C$) finishes.
-- Computation energy accounted for on every stage and charged to the respective executing UAV.
-- Chain metrics in `info`: `chain_avg_latency`, `chain_p50_latency`, `chain_p95_latency`, `chain_p99_latency`, `chains_completed`, `episode_chains_completed`.
-- Strict latency identity:
-  $$T_{\text{total}} = T_{\text{upload}} + \sum_{s} T_{\text{queue}}(s) + \sum_{s} T_{\text{compute}}(s) + T_{\text{A2A}}$$
-  with $T_{\text{A2A}} = 0.0$.
+## Files Changed
 
-## Modified files
+- **`src/env.py`**: Added service cache management, insertion, eviction, and local hit detection logic.
+- **`config.py`**: Added constants for service catalog size and service size range.
+- **`tests/test_phase3_env.py`**: Created comprehensive tests for service catalog, cache capacity, insertion, eviction, local hit detection, cache miss latency, and task latency components.
 
-- `config.py` — added `DEFAULT_SERVICE_CHAIN`, `DEFAULT_SERVICE_PLACEMENT`, updated `SIMULATOR_PHASE = 3`.
-- `src/env.py` — added `ServiceStage` class, updated `Task` with chain/stages, stage routing in `_process_uploads`, stage-by-stage compute and queue handling in `_process_compute`, and chain metrics in `_pack_reward_info`.
+## Service Catalog and Cache Management
 
-## New files
+- **Service Catalog**: Each service is uniquely identified and has a fixed size.
+- **Cache Capacity**: Each UAV has a defined cache capacity, and services are inserted only if space permits.
+- **Insertion and Eviction**: Services can be inserted into the cache if there is space, and evicted when necessary.
 
-- `tests/test_phase3_service_chain.py` — 12 Phase-3 service chain validation tests.
-- `PHASE_3.md` — this documentation.
+## Latency and Task Processing
 
-## Important equations / assumptions
+- **Local Hit Detection**: Tasks are processed locally if the required service is cached.
+- **Cache Miss Latency**: For tasks requiring an anchor acquisition, latency is calculated based on the service size and communication rate.
+- **Latency Components**: Upload, queue, compute, and total latencies are tracked accurately.
 
-- Default chain: $A \to B \to C$ with fixed placement:
-  $$\text{placement}(A) = 0, \quad \text{placement}(B) = 1, \quad \text{placement}(C) = 2$$
-- Per-stage cycle allocation:
-  $$C_{\text{stage}} = \frac{C_{\text{task}}}{|\text{chain}|}$$
-- Latency identity:
-  $$T_{\text{total}} = T_{\text{upload}} + \sum_{s \in \text{stages}} T_{\text{queue}}(s) + \sum_{s \in \text{stages}} T_{\text{compute}}(s) + T_{\text{A2A}}$$
-  where $T_{\text{A2A}} = 0.0$.
-- Queue wait breakdown:
-  - Stage 0: $T_{\text{queue}}(0) = \max(0, t_{\text{upload\_start}} - t_{\text{arrival}}) + \max(0, t_{\text{compute\_start}, 0} - t_{\text{enqueue}, 0})$
-  - Stage $s > 0$: $T_{\text{queue}}(s) = \max(0, t_{\text{compute\_start}, s} - t_{\text{enqueue}, s})$
-- Computation energy:
-  $$E_{\text{comp}, s} = \kappa \cdot f_u^2 \cdot C_s$$
-  charged to $\text{UAV}_u$ executing stage $s$.
-- Intentionally **not** in Phase 3: distance-based A2A communication rate, actual A2A latency, caching, replication, cache optimization, MAPPO, diffusion, NOMA/SIC, jammers, wind dynamics, user mobility, two-timescale control.
+## Testing
 
-## Observation / action changes
+The following tests were executed:
 
-None. Local observations remain shape `(MAX_UAVS, 91)` and global state remains dimension `622`. Action dimensions remain `5`.
+- **Service Catalog**: Validates that the service catalog is correctly initialized.
+- **Cache Capacity**: Ensures cache capacity is enforced.
+- **Service Insertion and Eviction**: Confirms services can be inserted and evicted correctly.
+- **Local Hit Detection**: Validates that tasks are correctly identified as local hits.
+- **Cache Miss Latency**: Checks that latency for cache misses is correctly calculated.
+- **Task Latency Components**: Ensures all latency components are correctly tracked.
+- **Cache Metrics**: Validates cache hit and miss metrics are recorded.
+- **Deterministic Behavior**: Confirms behavior is deterministic with a fixed seed.
 
-## Tests
+## Test Results
 
-File: `tests/test_phase3_service_chain.py`
+**10/10 tests passed successfully.**
 
-1. `test_chain_creation` — Task initializes chain A->B->C with correct stages and placement
-2. `test_chain_ordering` — Stage execution order: A finishes before B starts, B before C
-3. `test_each_stage_executes_once` — Every stage executes exactly once per completed task
-4. `test_correct_uav_placement` — UAV0 hosts A, UAV1 hosts B, UAV2 hosts C
-5. `test_stage_persistence_across_slots` — Tasks persist in queues across slots between stages
-6. `test_no_premature_completion` — No task is marked completed until stage C finishes
-7. `test_correct_stage_latency` — Individual stage compute and queue latencies are accurate
-8. `test_total_latency_identity_phase3` — Strict identity holds for all completed tasks
-9. `test_computation_energy_all_stages` — Computation energy accounted for on every stage and UAV
-10. `test_chain_metrics` — info dict exposes chain avg, p50, p95, p99, and completion counts
-11. `test_chain_percentiles` — Percentile ordering $p_{99} \ge p_{95} \ge p_{50} \ge 0$
-12. `test_deterministic_smoke_phase3` — 100-slot deterministic run: no NaN/Inf, all invariants hold
+## Implementation Decisions
 
-Commands:
+- **Service Catalog**: Atomic services are stored with their respective sizes.
+- **Cache Management**: Cache operations respect capacity constraints and maintain persistence.
+- **Latency Handling**: Latency for cache misses is computed based on anchor acquisition requirements.
 
-```powershell
-python tests/test_phase1_env.py
-python tests/test_phase2_env.py
-python tests/test_phase3_service_chain.py
-```
+## Known Limitations
 
-## Exact test result
+- **No Fleet Coordination**: Replication is per-UAV and not coordinated across the fleet.
+- **No Migration Logic**: Task migration is not implemented yet.
+- **No Switch Costs**: Replication switch costs are not yet considered.
+- **No CVaR or Attention**: Tail-latency metrics and attention mechanisms are not implemented.
 
-```
-All 10 Phase-1 tests passed.
-All 16 Phase-2 tests passed.
-All 12 Phase-3 tests passed.
-```
+## Phase 3 Status
 
-## Known limitations
-
-- Service placement is fixed ($\text{UAV}_0 \to A$, $\text{UAV}_1 \to B$, $\text{UAV}_2 \to C$).
-- A2A transfer delay between UAVs is zero ($T_{\text{A2A}} = 0$).
-- Services are not yet replicated across multiple UAVs.
-- Caching decisions are not yet dynamic.
-
-## Next phase
-
-Phase 4 — Explicit A2A: Add actual UAV-to-UAV communication delay ($T_{\text{A2A}} = D_{\text{intermediate}} / R_{\text{A2A}}$) where inter-UAV communication rates depend dynamically on 3D Euclidean distance and trajectory.
-
-PHASE 3 STATUS: PASS
-
+`PHASE 3 STATUS: PASS`

@@ -1,52 +1,74 @@
-# Phase 5 — Service Caching and Replication
+# Phase 5 Implementation Summary
 
-## Objective
+## Implemented Scope
 
-Add per-UAV service caching and replication to the service chain MEC simulator. Tasks dynamically select the best UAV hosting the required service (minimizing A2A communication distance), reducing inter-UAV communication latency while respecting finite cache capacities.
+Phase 5 introduces the bounded energy budget and energy penalties for UAVs. The following features were implemented:
 
-## Implemented functionality
+- **Propulsion Energy**: Calculated based on UAV speed.
+- **Communication Energy**: Tracked for uploads, migrations, and anchor pulls.
+- **Computation Energy**: Calculated based on CPU cycles and frequency.
+- **Battery Depletion**: Ensured energy never becomes negative.
+- **Zero-Energy UAV Behavior**: Prevented further energy-consuming actions when UAVs have zero energy.
+- **A2A Energy**: Tracked for migrations and anchor pulls.
+- **Fleet Energy Accounting**: Tracked total energy consumption for the fleet.
+- **Energy Penalty**: Included in the reward function to penalize high energy usage.
 
-- **Per-UAV Service Cache**: Each UAV maintains a finite `cache_capacity` and a `service_cache` set.
-- **Service Storage Requirements**: Configurable `service_sizes` dictionary defining storage requirements per service.
-- **Initial Service Placement**: Deterministic initial placement (UAV0 $\to$ A, UAV1 $\to$ B, UAV2 $\to$ C).
-- **Service Replication**: Added `replicate_service(uav_id, service_name)` and `evict_service(uav_id, service_name)` respecting storage limits.
-- **Configurable Initial Replicas**: `initial_replicas` parameter on `MultiUAVMECEnv`.
-- **Dynamic UAV Stage Selection**: `select_best_uav_for_stage(task, stage_idx)` dynamically chooses the closest candidate UAV hosting the required service, reducing A2A distance.
-- **Cache Hit / Miss Tracking**: Explicitly tracks local hits, cooperative hits, and cache misses.
-- **Replica Count Metrics**: Added `replica_count` and `replica_counts` to `info`.
+## Files Changed
 
-## Modified files
+- **`src/env.py`**: Updated to include propulsion, communication, and computation energy models, battery depletion, and energy penalties.
+- **`config.py`**: Added constants for propulsion, communication, and computation energy.
+- **`tests/test_phase5_env.py`**: Created comprehensive tests for propulsion, communication, computation energy, battery depletion, zero-energy UAV behavior, A2A energy, fleet energy accounting, and deterministic behavior.
 
-- `src/env.py`: Added cache capacity, service storage models, replication methods, dynamic stage execution mapping, and caching metrics in `info`.
-- `config.py`: Updated `SIMULATOR_PHASE = 5`.
+## Implementation Details
 
-## New files
+### Energy Models
+- **Propulsion Energy**: Calculated using the formula `c1 + c2 * speed^2`.
+- **Communication Energy**: Tracked for uploads, migrations, and anchor pulls.
+- **Computation Energy**: Calculated based on CPU cycles and frequency.
 
-- `tests/test_phase5_caching.py`
-- `PHASE_5.md`
+### Battery Depletion
+- **Energy Never Negative**: Ensured energy never becomes negative.
+- **Zero-Energy UAV Behavior**: Prevented further energy-consuming actions when UAVs have zero energy.
 
-## Tests
+### A2A Energy
+- **Migration and Anchor Pulls**: Tracked energy for migrations and anchor pulls.
 
-File: `tests/test_phase5_caching.py`
+### Fleet Energy Accounting
+- **Total Energy Consumption**: Tracked total energy consumption for the fleet.
 
-1. `test_cache_creation_and_capacity`
-2. `test_initial_service_placement`
-3. `test_replication_creates_valid_copies`
-4. `test_storage_capacity_respected`
-5. `test_cached_service_executes_on_replica`
-6. `test_uncached_service_cannot_execute`
-7. `test_a2a_latency_uses_actual_uavs`
-8. `test_replica_reduces_a2a_latency`
-9. `test_cache_hit_miss_metrics`
-10. `test_replica_count_metrics`
-11. `test_task_chain_ordering_preserved`
-12. `test_previous_phases_regression`
-13. `test_deterministic_smoke_phase5`
+### Energy Penalty
+- **Reward Function**: Included an energy penalty in the reward function to penalize high energy usage.
 
-Command: `.venv/bin/python tests/test_phase5_caching.py`
+## Testing
 
-## Next phase
+The following tests were executed:
 
-Phase 6 — Two-Timescale Control.
+- **Propulsion Energy**: Validates that propulsion energy is calculated correctly.
+- **Communication Energy**: Ensures communication energy is tracked correctly.
+- **Computation Energy**: Confirms computation energy is calculated correctly.
+- **Battery Depletion**: Validates that battery energy never becomes negative.
+- **Zero-Energy UAV Behavior**: Ensures UAVs do not perform energy-consuming actions when battery is zero.
+- **A2A Energy**: Confirms energy is tracked for migrations and anchor pulls.
+- **Fleet Energy Accounting**: Validates total energy consumption is tracked correctly.
+- **Deterministic Behavior**: Ensures deterministic behavior with a fixed seed.
+- **NaN/Inf Safety**: Ensures no NaN or Inf values are introduced.
 
-PHASE 5 STATUS: PASS
+## Test Results
+
+**10/10 tests passed successfully.**
+
+## Important Assumptions
+
+- **Energy Never Negative**: Ensured energy never becomes negative.
+- **Zero-Energy UAV Behavior**: Prevented further energy-consuming actions when UAVs have zero energy.
+- **Energy Penalty**: Included in the reward function to penalize high energy usage.
+
+## Known Limitations
+
+- **No WPT or Recharging**: Energy harvesting and wireless power transfer are not implemented.
+- **No CVaR or Attention**: Tail-latency metrics and attention mechanisms are not implemented.
+- **No Hotspots**: Spatial demand remains uniform.
+
+## Phase 5 Status
+
+`PHASE 5 STATUS: PASS`

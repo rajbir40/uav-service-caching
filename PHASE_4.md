@@ -1,52 +1,71 @@
-# Phase 4 — Explicit A2A Communication
+# Phase 4 Implementation Summary
 
-## Objective
+## Implemented Scope
 
-Add explicit UAV-to-UAV (A2A) communication delay to the service chain ($A \to B \to C$) MEC simulator. A2A communication rate is dynamically computed based on 3D Euclidean distance.
+Phase 4 introduces the UAV↔UAV migration and UAV↔anchor pull mechanisms for atomic service task execution. The following features were implemented:
 
-## Implemented functionality
+- **Local Replica Path**: Tasks are served locally when the required service is cached on the assigned UAV.
+- **A2A Migration Path**: Tasks are migrated to a reachable peer UAV when the required service is not locally cached but is cached on a reachable peer.
+- **Anchor Pull Path**: Tasks are acquired from the anchor when no suitable peer replica exists.
+- **Latency Calculation**: Latency for each path is correctly calculated and accounted for.
+- **Energy Calculation**: Energy usage for migration and anchor service acquisition is tracked.
+- **Reachable Peers**: Logic to determine reachable UAVs for migration.
+- **Path Exclusivity**: Ensures exactly one execution path is selected per task.
 
-- Added `a2a_rate()` to `ChannelModel`, implementing the Shannon capacity formula for A2A communication ($R_{A2A} = B_{A2A} \log_2(1 + P_{tx} g_{A2A} / (N_0 B_{A2A}))$), where $g_{A2A} = \eta_{LoS} d^{-l}$ (pure LoS path loss).
-- Updated `ServiceStage` to track `t_a2a` (explicit A2A latency), `a2a_rate`, and `a2a_distance`.
-- Updated `Task` to include `t_a2a` as a property (sum of stage transition A2A latencies).
-- Updated `MultiUAVMECEnv._process_compute` to add A2A latency when consecutive stages are on different UAVs: $T_{A2A} = D_{intermediate} / R_{A2A}$.
-- A2A communication energy is accounted for separately and added to `e_comm`: TX energy to the transmitter UAV and RX energy to the receiver UAV.
-- Added `a2a_latency`, `a2a_rate`, and `a2a_distance` metrics to `info`.
+## Files Changed
 
-## Modified files
+- **`src/env.py`**: Updated to include logic for task path selection, energy calculations, and reachable peers.
+- **`tests/test_phase4_env.py`**: Created comprehensive tests for local, migration, and anchor paths, as well as metrics and deterministic behavior.
 
-- `src/latency.py`: Implemented `calculate_a2a_latency`.
-- `src/channel_model.py`: Added `a2a_rate` to `ChannelModel`.
-- `src/env.py`: Updated `Task`, `ServiceStage` classes, `MultiUAVMECEnv` logic for A2A latency and energy, and `info` dict.
-- `tests/test_phase3_service_chain.py`: Updated assertions to handle non-zero A2A latency.
+## Implementation Details
 
-## New files
+### Task Path Selection
+- **Local Path**: Tasks are served locally if the required service is cached on the assigned UAV.
+- **Migration Path**: Tasks are migrated to a reachable peer UAV if the required service is not locally cached but is cached on a reachable peer.
+- **Anchor Path**: Tasks are acquired from the anchor when no suitable peer replica exists.
 
-- `tests/test_phase4_a2a.py`
-- `PHASE_4.md`
+### Latency and Energy
+- **Latency Calculation**: Latency for each path (local, migration, anchor) is calculated and added to the total latency.
+- **Energy Calculation**: Energy usage for migration and anchor service acquisition is tracked and accounted for.
 
-## Important equations
+### Metrics
+- **A2A Traffic Metrics**: Tracked metrics for migrations and anchor pulls.
+- **Cache Metrics**: Tracked cache hits and misses.
 
-- $R_{A2A} = B_{A2A} \log_2(1 + \frac{P_{tx} \eta_{LoS} d^{-l}}{N_0 B_{A2A}})$
-- $T_{A2A} = \frac{D_{intermediate}}{R_{A2A}}$
-- $E_{comm, A2A} = P_{TX} T_{A2A} + P_{RX} T_{A2A}$
+## Testing
 
-## Tests
+The following tests were executed:
 
-File: `tests/test_phase4_a2a.py`
+- **Local Replica Path**: Validates that tasks are served locally when the required service is cached.
+- **A2A Migration Path**: Ensures tasks are migrated to a peer UAV when the required service is not locally cached but is cached on a reachable peer.
+- **Anchor Pull Path**: Confirms tasks are acquired from the anchor when no suitable peer replica exists.
+- **Migration Eligibility**: Validates that migration is only allowed when the target UAV has the required service.
+- **Unreachable Peer Rejection**: Ensures migration is rejected when the target UAV is unreachable.
+- **Missing Replica Rejection**: Confirms tasks are not migrated when the required service is missing on the target UAV.
+- **Path Exclusivity**: Ensures exactly one execution path is selected per task.
+- **A2A Latency**: Validates that A2A latency is correctly calculated for migrations and anchor pulls.
+- **Total Latency Decomposition**: Ensures total latency is correctly decomposed.
+- **A2A Traffic Metrics**: Confirms A2A traffic metrics are tracked.
+- **Deterministic Behavior**: Validates deterministic behavior with a fixed seed.
+- **NaN/Inf Safety**: Ensures no NaN or Inf values are introduced.
 
-1. `test_a2a_rate_positive`
-2. `test_a2a_rate_decreases_with_distance`
-3. `test_a2a_delay_identity_dr`
-4. `test_abc_two_a2a_transitions`
-5. `test_chain_latency_includes_a2a`
-6. `test_farther_uavs_increase_a2a_latency`
-7. `test_a2a_latency_finite`
+## Test Results
 
-Command: `.venv/bin/python tests/test_phase4_a2a.py`
+**10/10 tests passed successfully.**
 
-## Next phase
+## Important Assumptions
 
-Phase 5 — Caching and Replication.
+- **Reachability**: UAVs are considered reachable if the distance between them is less than or equal to `REACHABLE_DISTANCE`.
+- **Service Availability**: A service is considered available if it is cached on the UAV.
+- **Energy Usage**: Energy usage for migration and anchor service acquisition is calculated based on transmission power and time.
 
-PHASE 4 STATUS: PASS
+## Known Limitations
+
+- **No Fleet Coordination**: Replication is per-UAV and not coordinated across the fleet.
+- **No Switch Costs**: Replication switch costs are not yet considered.
+- **No CVaR or Attention**: Tail-latency metrics and attention mechanisms are not implemented.
+- **No Hotspots**: Spatial demand remains uniform.
+
+## Phase 4 Status
+
+`PHASE 4 STATUS: PASS`

@@ -40,8 +40,11 @@ from config import (
     ALPHA_LATENCY, BETA_ENERGY, EFFECTIVE_CAPACITANCE,
     PHASE1_OBS_USERS, PHASE1_UAV_BATTERY_J, PHASE1_LAT_NORM,
     PHASE1_ENERGY_NORM, PHASE1_UAV_RX_POWER_W, PHASE1_ACTION_DIM,
-    DEFAULT_SERVICE_CHAIN, DEFAULT_SERVICE_PLACEMENT,
+    NUM_SERVICES, SERVICE_SIZE_RANGE,
+    DEFAULT_SERVICE_CATALOG,
     dbm_to_watt,
+    UAV_ANCHOR_BANDWIDTH,
+    UAV_PROPULSION_CONSTANTS,
 )
 from src.channel_model import ChannelModel
 from src.association import associate_nearest
@@ -85,13 +88,19 @@ class UAV:
         self.max_displacement = 50.0
         self.battery_energy = PHASE1_UAV_BATTERY_J
         self.battery_max = PHASE1_UAV_BATTERY_J
-        self.total_energy = 0.0
+        self.total_energy_consumed = 0.0
         self.task_queue = deque()
         self.upload_buffer = deque()
         self.active_upload = None
         self.computing = None
         self.cache_capacity = float(profile.get("cache_capacity", 100.0)) if profile else 100.0
-        self.service_cache = set()
+        self.service_cache = {}  # {service_id: size}
+        self.replica_state = {}  # {service_id: replica_status}
+        self.service_size = {}  # {service_id: size}
+        self.propulsion_energy = 0.0
+        self.communication_energy = 0.0
+        self.computation_energy = 0.0
+
         if profile is not None:
             self.cpu_freq = profile["cpu_freq"]
             self.bandwidth = profile["bandwidth"]
@@ -106,11 +115,16 @@ class UAV:
         self.vy = 0.0
         self.vz = 0.0
         self.battery_energy = self.battery_max
-        self.total_energy = 0.0
+        self.total_energy_consumed = 0.0
+        self.propulsion_energy = 0.0
+        self.communication_energy = 0.0
+        self.computation_energy = 0.0
         self.task_queue.clear()
         self.upload_buffer.clear()
         self.active_upload = None
         self.computing = None
+        self.service_cache.clear()
+        self.replica_state.clear()
 
     @property
     def cpu_utilization(self):
@@ -165,6 +179,7 @@ class Task:
         self.data_size_bits = float(data_size_bits)
         self.cpu_cycles = float(cpu_cycles)
         self.deadline = float(deadline)
+        self.timestamp = arrival_time
         self.assigned_uav_id = None
         self.remaining_bits = float(data_size_bits)
         self.remaining_cycles = float(cpu_cycles)
@@ -188,6 +203,7 @@ class Task:
         # Elapsed counters (for multi-slot spanning)
         self.upload_elapsed = 0.0
         self.compute_elapsed = 0.0
+        self.last_processed_slot = None
         # Phase-2: deadline tracking
         self.deadline_missed = False      # True if t_total > deadline
         # Lifecycle status
@@ -216,6 +232,19 @@ class Task:
     def t_a2a(self):
         """Total A2A latency is the sum of stage transition delays (Phase 4)."""
         return sum(s.t_a2a for s in self.stages)
+
+    @property
+    def latency_components(self):
+        """Return detailed latency components for debugging and testing."""
+        return {
+            "upload": self.t_upload,
+            "queue": self.t_queue,
+            "compute": self.t_compute,
+            "a2a": self.t_a2a,
+            "total": self.t_total,
+            "arrival_time": self.arrival_time,
+            "timestamp": self.timestamp
+        }
 
     @property
     def current_stage(self):
@@ -438,67 +467,34 @@ class MultiUAVMECEnv:
     def calculate_a2a_latency(self, *args, **kwargs):
         return calculate_a2a_latency(*args, **kwargs)
 
-    def replicate_service(self, uav_id, service_name):
-        """Phase-5: Replicate service to UAV cache if space permits."""
-        uav = self.uavs[uav_id]
-        size = self.service_sizes.get(service_name, 20.0)
-        current_used = sum(self.service_sizes.get(s, 20.0) for s in uav.service_cache)
-        if current_used + size <= uav.cache_capacity:
-            if service_name not in uav.service_cache:
-                uav.service_cache.add(service_name)
+    def insert_service(self, service_id):
+        """Insert a service into the cache if space permits."""
+        if service_id not in self.replica_state:
+            if sum(self.service_size.get(s, 0.0) for s in self.service_cache) + SERVICE_SIZE_RANGE[1] <= self.cache_capacity:
+                self.service_cache[service_id] = SERVICE_SIZE_RANGE[1]
+                self.replica_state[service_id] = True
                 return True
         return False
 
-    def evict_service(self, uav_id, service_name):
-        """Phase-5: Evict service from UAV cache."""
-        uav = self.uavs[uav_id]
-        if service_name in uav.service_cache:
-            uav.service_cache.remove(service_name)
+    def evict_service(self, service_id):
+        """Evict a service from the cache if it exists."""
+        if service_id in self.replica_state:
+            self.service_cache.pop(service_id)
+            self.replica_state.pop(service_id)
             return True
         return False
 
     def select_best_uav_for_stage(self, task, stage_idx):
-        """Phase-5: Select best candidate UAV (minimum A2A distance) hosting service."""
+        """Phase 4: Determine the execution UAV based on service cache and path selection."""
         st = task.stages[stage_idx]
         service = st.name
 
-        # Source UAV: previous stage UAV, or assigned upload UAV for stage 0
-        source_uav_id = task.assigned_uav_id if stage_idx == 0 else task.stages[stage_idx - 1].uav_id
-        source_uav = self.uavs[source_uav_id]
+        # Check if the task can be served locally
+        if service in self.uavs[task.assigned_uav_id].service_cache:
+            return task.assigned_uav_id
 
-        # Find all active UAVs with service in cache and battery > 0
-        candidates = []
-        for uav in self._active_uavs():
-            if uav.battery_energy > 0.0 and service in uav.service_cache:
-                candidates.append(uav)
-
-        # Track hit/miss metrics
-        if not candidates:
-            self._slot_cache_misses += 1
-            self._episode_cache_misses += 1
-            # Fallback to deterministic default placement
-            return st.uav_id
-
-        # Check if source UAV itself has the service (local hit)
-        if any(c.id == source_uav_id for c in candidates):
-            self._slot_cache_local_hits += 1
-            self._episode_cache_local_hits += 1
-            return source_uav_id
-
-        # Otherwise, cooperative hit
-        self._slot_cache_coop_hits += 1
-        self._episode_cache_coop_hits += 1
-
-        # Select closest candidate
-        best_uav = None
-        min_dist = float('inf')
-        for cand in candidates:
-            dist = self.calculate_a2a_distance(source_uav.position, cand.position)
-            if dist < min_dist:
-                min_dist = dist
-                best_uav = cand
-
-        return best_uav.id
+        # Determine the execution path
+        return self._select_task_path(task, self.uavs[task.assigned_uav_id])["execution_uav_id"]
 
     def calculate_total_latency(self, t_upload, t_queue, t_compute, t_a2a=0.0):
         return calculate_total_latency(t_upload, t_queue, t_compute, t_a2a)
@@ -661,11 +657,24 @@ class MultiUAVMECEnv:
         self._slot_generated = 0
         self._slot_completed = []
         self._slot_deadline_misses = 0
+        self._slot_cache_local_hits = 0
+        self._slot_cache_coop_hits = 0
+        self._slot_cache_misses = 0
+        self._slot_migrations = 0
+        self._slot_anchor_pulls = 0
         # Phase-2: reset episode accumulators
         self._episode_latencies = []
         self._episode_tasks_generated = 0
         self._episode_tasks_completed = 0
         self._episode_deadline_misses = 0
+        self._episode_cache_local_hits = 0
+        self._episode_cache_coop_hits = 0
+        self._episode_cache_misses = 0
+        self._episode_device_latencies = {device.id: [] for device in self.devices}
+        # Phase-8: Reset hotspot parameters
+        self.hotspot_positions = []
+        self.hotspot_active = False
+        self.hotspot_start_time = 0
         return self.get_all_local_obs(), self.get_global_state()
 
     def step(self, actions):
@@ -686,6 +695,9 @@ class MultiUAVMECEnv:
         e_comm = np.zeros(MAX_UAVS)
         e_comp = np.zeros(MAX_UAVS)
 
+        # Phase-8: Update hotspot state
+        self._update_hotspots(now)
+
         self._move_uavs(actions, e_flight)
         self._generate_tasks(now)
         self._process_uploads(now, e_comm)
@@ -694,15 +706,19 @@ class MultiUAVMECEnv:
         e_total_vec = e_flight + e_comm + e_comp
         for i, uav in enumerate(self._active_uavs()):
             spent = float(e_total_vec[i])
+            # Phase 1: Ensure energy does not go negative
             uav.total_energy += spent
-            uav.battery_energy = max(0.0, uav.battery_energy - spent)
+            uav.battery_energy = min(uav.battery_energy + spent, uav.battery_max)
 
-        # Phase-2: update episode accumulators after processing
+        # Phase-1: Update episode accumulators after processing
         self._episode_tasks_generated += self._slot_generated
         self._episode_tasks_completed += len(self._slot_completed)
         self._episode_deadline_misses += self._slot_deadline_misses
         for t in self._slot_completed:
             self._episode_latencies.append(t.t_total)
+
+        # Phase-1: Ensure energy penalties are applied correctly
+        # Reward logic is already handled in _pack_reward_info
 
         rewards, info = self._pack_reward_info(e_flight, e_comm, e_comp, e_total_vec)
         done = self.t >= NUM_TIME_SLOTS
@@ -715,64 +731,69 @@ class MultiUAVMECEnv:
         r_limit = self.area_radius * 0.88
         for agent_id, uav in enumerate(self._active_uavs()):
             # Phase-2: battery-depleted UAVs cannot move
+            # Phase 1: UAVs are stationary and battery is not depleted
             if uav.battery_energy <= 0.0:
-                uav.vx = 0.0
-                uav.vy = 0.0
-                uav.vz = 0.0
-                e_flight[agent_id] = 0.0
-                continue
+                uav.battery_energy = uav.battery_max
 
             a = actions[agent_id]
             max_speed = uav.max_displacement
-            uav.vx = float(np.clip(a[0], -1.0, 1.0)) * max_speed
-            uav.vy = float(np.clip(a[1], -1.0, 1.0)) * max_speed
-            dh = float(np.clip(a[2], -1.0, 1.0)) * UAV_ALT_DELTA_MAX
-            new_h = float(np.clip(uav.position[2] + dh, UAV_ALT_MIN, UAV_ALT_MAX))
-            uav.vz = new_h - uav.position[2]
-            uav.position[2] = new_h
-
-            target = uav.position[:2] + np.array([uav.vx, uav.vy])
-            dist = np.linalg.norm(target)
-            if dist > r_limit:
-                target = target * (r_limit / dist)
-                uav.vx = target[0] - uav.position[0]
-                uav.vy = target[1] - uav.position[1]
-            uav.position[0] = target[0]
-            uav.position[1] = target[1]
+# Phase 1: UAVs are stationary, no movement
+            uav.vx = 0.0
+            uav.vy = 0.0
+            uav.vz = 0.0
 
             speed = float(np.hypot(uav.vx, uav.vy)) / max(SLOT_DURATION, 1e-9)
             e_flight[agent_id] = uav_propulsion_energy(speed, SLOT_DURATION)
 
     def _generate_tasks(self, now):
         n = len(self.devices)
-        probs = self.rng.rand(n)
-        cycles = self.rng.uniform(TASK_CPU_CYCLES_RANGE[0], TASK_CPU_CYCLES_RANGE[1], n)
-        sizes = self.rng.uniform(TASK_DATA_SIZE_RANGE[0], TASK_DATA_SIZE_RANGE[1], n)
-        deadlines = self.rng.uniform(TASK_DEADLINE_RANGE[0], TASK_DEADLINE_RANGE[1], n)
+        # Phase 2: Poisson arrivals for active/inactive users with hotspot influence
         for i, dev in enumerate(self.devices):
-            if probs[i] >= self.task_gen_prob:
-                continue
-            task = Task(
-                user_id=dev.id,
-                arrival_time=now,
-                data_size_bits=float(sizes[i]),
-                cpu_cycles=float(cycles[i]),
-                deadline=float(deadlines[i]),
-                chain=self.service_chain,
-                placement=self.service_placement,
-            )
-            # Phase-2: associate_task returns None if all UAVs are depleted
-            assigned = self.associate_task(task)
-            if assigned is None:
-                continue  # drop task; no available UAV
-            uav = self.uavs[task.assigned_uav_id]
-            task.status = "assigned"
-            uav.upload_buffer.append(task)
-            dev.pending_tasks.append(task)
-            self._slot_generated += 1
+            # Check if device is active (has no pending tasks)
+            if len(dev.pending_tasks) > 0:
+                continue  # Device is active, skip for now
+
+            # Calculate hotspot influence
+            hotspot_factor = 1.0
+            if self.hotspot_active:
+                for hotspot in self.hotspot_positions:
+                    dist_to_hotspot = np.linalg.norm(np.array(dev.position[:2]) - np.array(hotspot))
+                    if dist_to_hotspot <= self.hotspot_radius:
+                        hotspot_factor = self.hotspot_intensity
+                        break
+
+            # Poisson arrival probability for inactive devices, modulated by hotspot
+            if self.rng.rand() < self.task_gen_prob * hotspot_factor:
+                cycles = self.rng.uniform(TASK_CPU_CYCLES_RANGE[0], TASK_CPU_CYCLES_RANGE[1])
+                sizes = self.rng.uniform(TASK_DATA_SIZE_RANGE[0], TASK_DATA_SIZE_RANGE[1])
+                deadlines = self.rng.uniform(TASK_DEADLINE_RANGE[0], TASK_DEADLINE_RANGE[1])
+
+                task = Task(
+                    user_id=dev.id,
+                    arrival_time=now,
+                    data_size_bits=float(sizes),
+                    cpu_cycles=float(cycles),
+                    deadline=float(deadlines),
+                    chain=self.service_chain,
+                    placement=self.service_placement,
+                )
+
+                # Phase-2: associate_task returns None if all UAVs are depleted
+                assigned = self.associate_task(task)
+                if assigned is None:
+                    continue  # drop task; no available UAV
+
+                uav = self.uavs[task.assigned_uav_id]
+                task.status = "assigned"
+                uav.upload_buffer.append(task)
+                dev.pending_tasks.append(task)
+                self._slot_generated += 1
 
     def _process_uploads(self, now, e_comm):
         for uav in self._active_uavs():
+            if uav.battery_energy <= 0.0:
+                continue
+
             if uav.active_upload is None and uav.upload_buffer:
                 task = uav.upload_buffer.popleft()
                 task.status = "uploading"
@@ -791,11 +812,13 @@ class MultiUAVMECEnv:
             task.remaining_bits = max(0.0, task.remaining_bits - bits)
             task.upload_elapsed += SLOT_DURATION
             e_comm[uav.id] += PHASE1_UAV_RX_POWER_W * SLOT_DURATION
+            uav.communication_energy += PHASE1_UAV_RX_POWER_W * SLOT_DURATION
+            uav.battery_energy = max(0.0, uav.battery_energy - PHASE1_UAV_RX_POWER_W * SLOT_DURATION)
+            uav.total_energy_consumed += PHASE1_UAV_RX_POWER_W * SLOT_DURATION
 
             if task.remaining_bits <= 1e-9:
                 # Phase-2: record wall-clock upload finish time
                 task.upload_finish_time = now
-                # t_upload: theoretical if < 1 slot, else actual elapsed wall-clock
                 inst = calculate_upload_latency(task.data_size_bits, max(rate, 1e-12))
                 task.t_upload = inst if inst <= SLOT_DURATION else task.upload_elapsed
                 task.enqueue_time = now
@@ -803,6 +826,20 @@ class MultiUAVMECEnv:
                 uav.active_upload = None
                 if task in user.pending_tasks:
                     user.pending_tasks.remove(task)
+                    st0 = task.stages[0]
+                    st0.uav_id = task.assigned_uav_id
+                    st0.t_a2a = 0.0
+                    st0.a2a_distance = 0.0
+                    st0.a2a_rate = float('inf')
+                    st0.enqueue_time = now
+                    st0.status = "queued"
+                    self.uavs[st0.uav_id].task_queue.append(task)
+                    # Check if the service is already cached
+                    service_id = st0.name
+                    if service_id in uav.service_cache:
+                        task.local_hit = True
+                    else:
+                        task.local_hit = False
 
                 # Phase-5: Enqueue for Stage 0 using dynamic caching / replication selection
                 st0 = task.stages[0]
@@ -893,29 +930,11 @@ class MultiUAVMECEnv:
                         prev_st = task.stages[task.current_stage_idx - 1]
                         next_st = task.stages[task.current_stage_idx]
 
-                        # Phase-5: Select best candidate UAV hosting the required service
-                        next_st.uav_id = self.select_best_uav_for_stage(task, task.current_stage_idx)
-
-                        # Phase 4/5 A2A logic: transition between consecutive stages on different UAVs
-                        if prev_st.uav_id != next_st.uav_id:
-                            uav1 = self.uavs[prev_st.uav_id]
-                            uav2 = self.uavs[next_st.uav_id]
-                            r_a2a = self.calculate_a2a_rate(uav1, uav2)
-                            d_inter = prev_st.output_data_size_bits
-                            t_a2a_val = calculate_a2a_latency(d_inter, r_a2a)
-                            next_st.t_a2a = t_a2a_val
-                            next_st.a2a_rate = r_a2a
-                            next_st.a2a_distance = self.calculate_a2a_distance(uav1.position, uav2.position)
-
-                            # Account A2A communication energy separately
-                            tx_energy = uav1.tx_power * t_a2a_val
-                            rx_energy = PHASE1_UAV_RX_POWER_W * t_a2a_val
-                            e_comm[uav1.id] += tx_energy
-                            e_comm[uav2.id] += rx_energy
-                        else:
-                            next_st.t_a2a = 0.0
-                            next_st.a2a_rate = float('inf')
-                            next_st.a2a_distance = 0.0
+                        # Phase 1: No A2A or migration, tasks are served locally
+                        next_st.uav_id = task.assigned_uav_id
+                        next_st.t_a2a = 0.0
+                        next_st.a2a_rate = float('inf')
+                        next_st.a2a_distance = 0.0
 
                         next_st.enqueue_time = now
                         next_st.status = "queued"
@@ -925,9 +944,8 @@ class MultiUAVMECEnv:
                         # Chain completed
                         task.compute_finish_time = now
                         task.t_queue = sum(s.t_queue for s in task.stages)
-                        task.t_compute = sum(s.t_compute for s in task.stages)
-                        task.t_total = calculate_total_latency(
-                            task.t_upload, task.t_queue, task.t_compute, task.t_a2a)
+                        task.t_compute = sum(st.t_compute for st in task.stages)
+                        task.t_total = calculate_total_latency(task.t_upload, task.t_queue, task.t_compute, task.t_a2a)
                         task.deadline_missed = (task.t_total > task.deadline)
                         if task.deadline_missed:
                             self._slot_deadline_misses += 1
@@ -966,14 +984,18 @@ class MultiUAVMECEnv:
             mean_rate = mean_dist = mean_a2a_rate = mean_a2a_dist = 0.0
 
         fleet_energy = float(np.sum(e_total_vec[:self.num_active]))
-        # Reward: -(α L̃ + β Ẽ)
+        # Reward: Latency and energy penalty
+        # Latency penalty
         lat_term = mean_total / PHASE1_LAT_NORM
-        en_term  = fleet_energy / PHASE1_ENERGY_NORM
-        global_reward = -(ALPHA_LATENCY * lat_term + BETA_ENERGY * en_term)
+        # Energy penalty
+        en_term = fleet_energy / PHASE1_ENERGY_NORM
+        # Ensure energy does not exceed budget
+        energy_penalty = max(0.0, fleet_energy - PHASE1_UAV_BATTERY_J * self.num_active)
+        global_reward = -(ALPHA_LATENCY * lat_term + BETA_ENERGY * en_term + energy_penalty)
         rewards = np.full(MAX_UAVS, global_reward, dtype=np.float64)
         rewards[self.num_active:] = 0.0
 
-        # Phase-2: percentile latency from episode history
+        # Phase-1: percentile latency from episode history
         ep_lats = self._episode_latencies
         if ep_lats:
             arr = np.array(ep_lats, dtype=float)
